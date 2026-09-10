@@ -1,0 +1,31 @@
+/target
+/dist
+Cargo.lock
+
+# Python build artifacts
+*.egg-info/
+*.whl
+__pycache__/
+*.pyc
+.venv/
+
+# WASM build artifacts
+pkg/
+*.wasm
+
+# WAL data
+.tpt-microlog/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+*.env.local

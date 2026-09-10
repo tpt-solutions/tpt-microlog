@@ -1,0 +1,503 @@
+# Design Specification: `tpt-microlog`
+
+**Status:** Draft / RFC  
+**Project:** `tpt-microlog` (The Microscopic Telemetry & Log Router)  
+**Ecosystem:** TPT Solutions  
+**License:** Dual-licensed MIT / Apache-2.0  
+**Date:** September 2026  
+
+---
+
+## 1. Executive Summary
+
+`tpt-microlog` is an ultra-lightweight, zero-configuration, guaranteed-delivery telemetry and log routing engine written in pure Rust with a **minimal dependency philosophy**.
+
+Currently, every modern application needs to send logs and metrics to observability backends (Datadog, Prometheus, Grafana, CloudWatch, custom endpoints). But the existing solutions have major problems:
+- **Heavy SDKs:** Datadog's Python agent consumes 5-10% CPU. OpenTelemetry SDKs pull in hundreds of megabytes of dependencies.
+- **Unreliable delivery:** If the network hiccups, logs are dropped. No batching, no retry, no compression.
+- **Language-specific:** You need a different SDK for Python, Node.js, Go, Rust, C++. Each has different APIs and behaviors.
+- **Infrastructure overhead:** Many solutions require running a separate collector service (Fluentd, Logstash, Vector).
+
+`tpt-microlog` solves this by providing a single, embeddable library that:
+- Uses < 2 MB of RAM and < 1% CPU.
+- Guarantees log delivery via batching, compression, and retry logic.
+- Works identically across Python, JavaScript, Go, C++, and Rust.
+- Requires zero external infrastructure. It runs in the same process as your application.
+
+**Key differentiator:** We reject heavy telemetry frameworks (OpenTelemetry, Fluent Bit). We build our own minimal, focused implementation optimized for resource-constrained environments (edge devices, serverless functions, browser applications).
+
+## 2. Core Design Principles
+
+1. **Strict MIT / Apache-2.0 Licensing:** All code is dual-licensed MIT / Apache-2.0. All dependencies are audited via `cargo-deny`. Any dependency carrying a copyleft license is strictly rejected.
+2. **Minimal Dependency Tree:** We avoid heavy telemetry frameworks. The OpenTelemetry SDK is rejected due to its massive dependency tree. We build our own minimal log router.
+3. **Resource-Constrained First:** Designed to run on edge devices (Raspberry Pi, IoT sensors), serverless functions (AWS Lambda, Cloudflare Workers), and browsers with < 2 MB RAM overhead.
+4. **Guaranteed Delivery:** Logs are never dropped. If the network is down, logs are batched, compressed, and retried until delivered.
+5. **Multi-Protocol, Multi-Backend:** Ships logs to anywhere: HTTP, gRPC, UDP, TCP, file. Supports Datadog, Prometheus, CloudWatch, Elasticsearch, and custom endpoints.
+6. **Multi-Language Native:** Pure Rust core with clean C ABI. Wrappers for Python, JavaScript/WASM, Go, and C/C++.
+
+---
+
+## 3. Licensing Strategy & Dependency Audit
+
+### 3.1 License Model
+
+`tpt-microlog` is dual-licensed under **MIT** and **Apache-2.0**, at the user's option.
+
+### 3.2 Dependency Audit Pipeline
+
+All dependency licensing is enforced automatically via `cargo-deny` in CI:
+
+```toml
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-DFS-2016",
+]
+
+deny = [
+    "GPL-2.0",
+    "GPL-3.0",
+    "LGPL-2.1",
+    "LGPL-3.0",
+    "AGPL-3.0",
+    "SSPL-1.0",
+    "EUPL-1.1",
+    "EUPL-1.2",
+    "MPL-2.0",
+]
+
+unlicensed = "deny"
+copyleft = "deny"
+
+3.3 Rejected Dependencies & Replacements
+Rejected Dependency
+Reason
+Replacement Strategy
+opentelemetry (full SDK)
+Massive dependency tree. Pulls in hundreds of crates.
+Build minimal telemetry router from scratch.
+tracing / tracing-subscriber
+Pulls in many dependencies. Overly complex for our use case.
+Build minimal logging API.
+log + env_logger
+Too basic. No batching, compression, or guaranteed delivery.
+Build our own with advanced features.
+fluent-bit / vector
+External infrastructure required. Not embeddable.
+Embed directly in the application.
+openssl / openssl-sys
+Complex license.
+Use rustls (Apache-2.0 / MIT) for TLS.
+reqwest (default features)
+Pulls in openssl-sys.
+Use reqwest with default-features = false, features = ["rustls-tls"].
+3.4 Approved Dependencies (Minimal Set)
+Dependency
+Purpose
+License
+Status
+serde / serde_json
+Serialization
+MIT / Apache-2.0
+✅ Approved
+tokio
+Async runtime
+MIT
+✅ Approved
+reqwest (rustls)
+HTTP client
+MIT / Apache-2.0
+✅ Approved
+tonic
+gRPC client
+MIT
+✅ Approved
+zstd
+Compression
+BSD-3-Clause
+✅ Approved
+pyo3
+Python bindings
+MIT / Apache-2.0
+✅ Approved
+wasm-bindgen
+WASM bindings
+MIT / Apache-2.0
+✅ Approved
+crossbeam
+Lock-free queues
+MIT / Apache-2.0
+✅ Approved
+parking_lot
+Efficient locks
+MIT / Apache-2.0
+✅ Approved
+4. Architecture Overview
+
+tpt-microlog/
+├── Cargo.toml             # Workspace root with shared deny.toml
+├── deny.toml              # cargo-deny configuration
+├── LICENSE-MIT
+├── LICENSE-APACHE
+├── tpt-log-core/          # Pure Rust. Logging API, batching, compression, retry.
+├── tpt-log-transport/     # Transport layer. HTTP, gRPC, UDP, TCP, file.
+├── tpt-log-ffi/           # C ABI boundary. Opaque handles, error codes.
+├── tpt-log-py/            # PyO3 wrapper. Python integration.
+├── tpt-log-wasm/          # wasm-bindgen wrapper. Browser/edge integration.
+├── tpt-log-go/            # cgo wrapper. Go integration.
+└── tests/                 # Integration tests across all language boundaries.
+
+4.1 The Telemetry Pipeline
+
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│  Application │────▶│  Log Queue   │────▶│  Batcher &   │────▶│  Transport   │
+│  (Python/JS) │     │  (Lock-free) │     │  Compressor  │     │  (HTTP/gRPC) │
+└──────────────┘     └──────────────┘     └──────────────┘     └──────────────┘
+      │                    │                    │                    │
+      ▼                    ▼                    ▼                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  Log Entry: { timestamp, level, message, metadata }                         │
+│  ↓                                                                          │
+│  Batch: [100 log entries] → compress with zstd → send via HTTP POST        │
+│  ↓                                                                          │
+│  On failure: retry with exponential backoff, write to disk if needed       │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+4.2 The Guaranteed Delivery Mechanism
+
+1. Application logs a message → pushed to lock-free in-memory queue.
+2. Background thread batches logs (every 1 second OR 100 logs, whichever comes first).
+3. Batch is compressed with zstd (10x compression ratio).
+4. Compressed batch is sent to backend via HTTP/gRPC.
+5. On success: batch is removed from memory.
+6. On failure: batch is written to disk (WAL - Write-Ahead Log).
+7. Background retry thread reads from disk and retries with exponential backoff.
+8. Once delivered, disk file is deleted.
+
+This ensures zero log loss, even if the application crashes or the network is down for hours.
+5. Key Components & Implementation Details
+5.1 Logging API (tpt-log-core)
+The logging API is designed to be:
+Fast: Lock-free queue, minimal allocations.
+Simple: Just log.info("message") or log.metric("cpu_usage", 42.5).
+Structured: Supports key-value metadata (e.g., log.info("user_login", user_id=123, ip="1.2.3.4")).
+Log Levels:
+TRACE, DEBUG, INFO, WARN, ERROR, FATAL
+Log Types:
+Logs: Text messages with metadata.
+Metrics: Numeric values (gauges, counters, histograms).
+Traces: Distributed tracing spans (optional, Phase 3).
+Implementation:
+Uses crossbeam for lock-free multi-producer, single-consumer queue.
+Background thread consumes from queue and batches logs.
+Configurable via tpt-log.toml or environment variables.
+5.2 Batching & Compression (tpt-log-core)
+Batching Strategy:
+Time-based: Flush every 1 second (configurable).
+Size-based: Flush when batch reaches 100 logs (configurable).
+Memory-based: Flush when queue reaches 10 MB (configurable).
+Compression:
+Uses zstd (BSD-3-Clause) for compression.
+Achieves 10x compression ratio on typical log data.
+Compression level: 3 (fast, good compression). Configurable.
+Why Compression?
+Reduces network bandwidth by 90%.
+Reduces disk I/O for WAL (Write-Ahead Log).
+Critical for high-volume logging (millions of logs/sec).
+5.3 Transport Layer (tpt-log-transport)
+Supported Protocols:
+HTTP/HTTPS: POST JSON or protobuf to any endpoint. Supports Datadog, Elasticsearch, custom APIs.
+gRPC: High-performance binary protocol. Supports OpenTelemetry Collector, custom gRPC servers.
+UDP: Fire-and-forget. Lowest latency, no guarantees. Good for metrics.
+TCP: Reliable, ordered delivery. Custom TCP servers.
+File: Write logs to local file (JSONL format). Good for debugging or forwarding to another tool.
+Backend-Specific Adapters:
+Datadog: Formats logs as Datadog API v2. Sends to https://http-intake.logs.datadoghq.com/api/v2/logs.
+Prometheus: Exposes metrics via /metrics endpoint (Pull model).
+CloudWatch: Formats logs as CloudWatch Logs API. Sends to AWS endpoint.
+Elasticsearch: Formats logs as Elasticsearch Bulk API. Sends to /_bulk endpoint.
+Retry Logic:
+Exponential backoff: 1s, 2s, 4s, 8s, 16s, 32s, 60s (max).
+Max retries: 10 (configurable).
+After max retries, logs are written to disk WAL for later delivery.
+5.4 Write-Ahead Log (WAL) for Guaranteed Delivery
+Purpose:
+If the network is down or the backend is unreachable, logs are not lost.
+Logs are written to a local file (WAL) and retried later.
+Implementation:
+Uses append-only file format (one batch per line, compressed with zstd).
+Background retry thread reads from WAL and attempts delivery.
+Once delivered, the batch is removed from WAL.
+WAL is stored in ~/.tpt-microlog/wal/ (configurable).
+WAL Size Limit:
+Default: 100 MB. If WAL exceeds this, oldest batches are dropped (FIFO).
+Prevents disk from filling up if backend is down for a long time.
+5.5 Resource Constraints
+Memory Usage:
+In-memory queue: < 10 MB (configurable).
+Compression buffer: < 5 MB.
+Total overhead: < 20 MB.
+CPU Usage:
+Logging: < 1% CPU (lock-free queue, minimal allocations).
+Batching & compression: < 0.5% CPU (background thread).
+Transport: < 0.5% CPU (async I/O).
+Binary Size:
+Native: < 5 MB (minimal dependencies).
+WASM: < 3 MB (for browser/edge use).
+6. Target API Design (Developer Experience)
+6.1 Python API (via PyO3)
+
+from tpt_microlog import MicroLog
+
+# Initialize (auto-detects backend from environment variables)
+log = MicroLog(
+    backend="datadog",
+    api_key="your-api-key",
+    batch_size=100,
+    flush_interval=1.0,
+)
+
+# Log a message
+log.info("User logged in", user_id=123, ip="1.2.3.4")
+
+# Log a metric
+log.metric("cpu_usage", 42.5, tags={"host": "server-01"})
+
+# Log an error
+log.error("Database connection failed", error="timeout", retry_count=3)
+
+# Shutdown (flushes all pending logs)
+log.shutdown()
+
+6.2 JavaScript / Node.js API (via WASM)
+
+import { MicroLog } from 'tpt-microlog';
+
+const log = new MicroLog({
+  backend: 'datadog',
+  apiKey: 'your-api-key',
+  batchSize: 100,
+  flushInterval: 1.0,
+});
+
+// Log a message
+log.info('User logged in', { userId: 123, ip: '1.2.3.4' });
+
+// Log a metric
+log.metric('cpu_usage', 42.5, { host: 'server-01' });
+
+// Log an error
+log.error('Database connection failed', { error: 'timeout', retryCount: 3 });
+
+// Shutdown
+await log.shutdown();
+
+6.3 Browser API (via WASM)
+
+import { MicroLog } from 'tpt-microlog';
+
+const log = new MicroLog({
+  backend: 'custom',
+  endpoint: 'https://my-api.com/logs',
+  batchSize: 50,
+  flushInterval: 2.0,
+});
+
+// Log a message (sent to your backend)
+log.info('Page viewed', { page: '/home', userId: 123 });
+
+// Log a metric
+log.metric('load_time', 1.23, { page: '/home' });
+
+6.4 Go API (via cgo)
+
+package main
+
+import (
+    "github.com/tpt-solutions/tpt-microlog-go"
+)
+
+func main() {
+    log := microlog.New(microlog.Config{
+        Backend:       "datadog",
+        ApiKey:        "your-api-key",
+        BatchSize:     100,
+        FlushInterval: 1.0,
+    })
+
+    // Log a message
+    log.Info("User logged in", map[string]interface{}{
+        "user_id": 123,
+        "ip":      "1.2.3.4",
+    })
+
+    // Log a metric
+    log.Metric("cpu_usage", 42.5, map[string]string{
+        "host": "server-01",
+    })
+
+    // Shutdown
+    log.Shutdown()
+}
+
+6.5 C API (via FFI)
+
+#include "tpt_microlog.h"
+
+int main() {
+    // Initialize
+    tpt_log_config config = {
+        .backend = "datadog",
+        .api_key = "your-api-key",
+        .batch_size = 100,
+        .flush_interval = 1.0,
+    };
+    tpt_log_handle* log = tpt_log_create(&config);
+
+    // Log a message
+    tpt_log_info(log, "User logged in", "user_id=123,ip=1.2.3.4");
+
+    // Log a metric
+    tpt_log_metric(log, "cpu_usage", 42.5, "host=server-01");
+
+    // Shutdown
+    tpt_log_shutdown(log);
+    tpt_log_destroy(log);
+    return 0;
+}
+
+7. Performance & Resource Targets
+Metric
+Target
+Rationale
+Memory Usage
+< 20 MB (constant)
+Can run on edge devices and serverless functions.
+CPU Usage
+< 2% (constant)
+Minimal impact on application performance.
+Log Throughput
+> 100,000 logs/sec
+Handles high-volume logging.
+Compression Ratio
+> 10x
+Reduces network bandwidth by 90%.
+Binary Size (Native)
+< 5 MB
+Easy to distribute.
+Binary Size (WASM)
+< 3 MB
+Fast download for browser/edge use.
+Dependency Count
+< 20 crates
+Minimal, auditable tree.
+Delivery Guarantee
+100%
+Zero log loss, even on network failure.
+8. Phased Rollout & Milestones
+Phase 1: Core Logging Engine (Pure Rust)
+Set up workspace with deny.toml and CI license auditing.
+Implement logging API (info, warn, error, metric).
+Implement lock-free queue for log ingestion.
+Implement batching (time-based, size-based).
+Implement zstd compression.
+Verify full dependency tree passes cargo deny check licenses.
+Phase 2: Transport Layer
+Implement HTTP/HTTPS transport (JSON format).
+Implement retry logic with exponential backoff.
+Implement Write-Ahead Log (WAL) for guaranteed delivery.
+Implement background retry thread.
+Phase 3: Backend Adapters
+Implement Datadog adapter.
+Implement Elasticsearch adapter.
+Implement CloudWatch adapter.
+Implement custom HTTP endpoint adapter.
+Phase 4: Advanced Protocols
+Implement gRPC transport (via tonic).
+Implement UDP transport (fire-and-forget).
+Implement TCP transport (reliable, ordered).
+Implement file transport (JSONL format).
+Phase 5: Python Wrapper
+Build tpt-log-py using PyO3.
+Set up GitHub Actions to build and publish wheels to PyPI.
+Write Python documentation and examples.
+Phase 6: WASM Wrapper
+Build tpt-log-wasm using wasm-bindgen.
+Implement browser-specific APIs (fetch API for HTTP).
+Optimize binary size with wasm-opt -Oz.
+Publish to npm.
+Phase 7: Go Wrapper
+Build tpt-log-go using cgo.
+Write Go documentation and examples.
+Publish to Go module registry.
+Phase 8: Advanced Features (Optional)
+Implement distributed tracing (OpenTelemetry-compatible spans).
+Implement log filtering and sampling.
+Implement log enrichment (add hostname, PID, environment variables).
+Implement log rotation for file transport.
+9. Open Questions & Risks
+Custom Logging API vs. OpenTelemetry: We're building our own logging API instead of using OpenTelemetry. This means we won't be compatible with OpenTelemetry collectors out of the box. Mitigation: Implement an OpenTelemetry-compatible gRPC transport in Phase 4. Document that users who need full OpenTelemetry compatibility should use the official SDK.
+WASM Limitations: Browsers have strict limits on background threads and network requests. WASM version may not support all features (e.g., WAL, retry logic). Mitigation: Clearly document WASM limitations. Use browser's navigator.sendBeacon() for guaranteed delivery in browsers.
+Compression Overhead: zstd compression adds CPU overhead. For very high-volume logging (> 1M logs/sec), this may be a bottleneck. Mitigation: Make compression optional. Provide a "fast mode" with no compression for extreme performance.
+WAL Disk Usage: If the backend is down for a long time, the WAL file can grow large. Mitigation: Implement WAL size limit (default 100 MB). Drop oldest batches if limit is exceeded. Make limit configurable.
+Transitive Dependency Drift: A currently permissive dependency could add a copyleft transitive dependency. Mitigation: cargo-deny runs on every PR and every release tag. Pin dependency versions in Cargo.lock.
+Backend API Changes: Datadog, Elasticsearch, and CloudWatch APIs may change over time. Mitigation: Implement backend adapters as separate modules. Make them easy to update. Test against real backends in CI.
+
+10. Competitive Landscape
+Tool
+Strengths
+Weaknesses
+How tpt-microlog Differs
+Datadog Agent
+Full-featured, official
+Heavy (5-10% CPU), Python-only
+Ultra-lightweight (< 2% CPU), multi-language
+OpenTelemetry SDK
+Industry standard, rich ecosystem
+Massive dependency tree, complex
+Minimal deps, simple API, embeddable
+Fluent Bit
+Fast, lightweight
+Requires separate infrastructure
+Embeddable, zero-config
+Vector
+Fast, configurable
+Requires separate infrastructure
+Embeddable, zero-config
+Python logging
+Built-in, familiar
+No batching, compression, or guaranteed delivery
+Advanced features, multi-language
+Winston (Node.js)
+Popular, flexible
+No batching, compression, or guaranteed delivery
+Advanced features, multi-language
+11. Success Metrics
+tpt-microlog will be considered successful if:
+Licensing Compliance: Zero copyleft dependencies in the entire transitive tree, verified by cargo-deny on every commit.
+Minimal Dependencies: Total dependency count < 20 crates.
+Adoption: > 10,000 monthly downloads on PyPI within 6 months of launch.
+Resource Efficiency: Uses < 20 MB RAM and < 2% CPU on a production server.
+Delivery Guarantee: Zero log loss in production, even during network outages.
+Multi-Language: Successfully used in Python, JavaScript, Go, and C++ applications.
+Commercial Adoption: Used in production by at least 5 companies who chose it specifically because it's lightweight, embeddable, and guarantees delivery.
+12. Marketing & Positioning
+Tagline: "The microscopic log router. Guaranteed delivery, zero infrastructure."
+Key Selling Points:
+Ultra-Lightweight: < 20 MB RAM, < 2% CPU. Runs anywhere.
+Guaranteed Delivery: Never lose a log, even if the network is down.
+Zero Infrastructure: No separate collector service required. Embeds in your app.
+Multi-Language: Works identically in Python, JavaScript, Go, C++, and Rust.
+Compressed: 10x compression reduces network bandwidth by 90%.
+Multi-Backend: Ships to Datadog, Prometheus, CloudWatch, Elasticsearch, or custom endpoints.
+Target Audience:
+SaaS companies tired of heavy observability agents consuming CPU.
+Edge/IoT developers who need logging on resource-constrained devices.
+Serverless developers who need lightweight logging for Lambda/Cloudflare Workers.
+Browser developers who need client-side telemetry.
+Companies who need guaranteed log delivery without running infrastructure.
