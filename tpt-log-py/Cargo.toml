@@ -6,6 +6,11 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Python wrapper for tpt-microlog (PyO3)."
+readme = "README.md"
+homepage = "https://github.com/tpt-solutions/tpt-microlog/tree/master/tpt-log-py"
+documentation = "https://docs.rs/tpt-log-py"
+keywords = ["logging", "telemetry", "python", "pyo3", "datadog"]
+categories = ["api-bindings", "development-tools::debugging", "wasm", "development-tools"]
 
 [lib]
 name = "tpt_log_py"

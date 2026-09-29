@@ -5,11 +5,26 @@ build-backend = "maturin"
 [project]
 name = "tpt-microlog"
 description = "The microscopic telemetry & log router. Guaranteed delivery, zero infrastructure."
-readme = "../README.md"
+readme = "README.md"
 license = { text = "MIT OR Apache-2.0" }
 authors = [{ name = "TPT Solutions" }]
 requires-python = ">=3.9"
-keywords = ["logging", "metrics", "telemetry", "observability", "datadog"]
+keywords = [
+    "logging",
+    "metrics",
+    "telemetry",
+    "observability",
+    "datadog",
+    "elasticsearch",
+    "opentelemetry",
+    "structured-logging",
+    "zero-config",
+    "batching",
+    "compression",
+    "developer-tools",
+    "monitoring",
+    "performance",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",

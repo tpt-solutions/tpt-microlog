@@ -13,8 +13,20 @@
     "metrics",
     "telemetry",
     "observability",
-    "wasm",
-    "browser"
+    "datadog",
+    "browser",
+    "webassembly",
+    "structured-logging",
+    "batching",
+    "compression",
+    "frontend",
+    "analytics",
+    "sendbeacon",
+    "performance",
+    "developer-tools",
+    "monitoring",
+    "opentelemetry",
+    "zero-config"
   ],
   "type": "module",
   "main": "dist/tpt_log_wasm.js",
@@ -22,7 +34,8 @@
   "files": [
     "dist",
     "index.d.ts",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ],
   "engines": {
     "node": ">=18"

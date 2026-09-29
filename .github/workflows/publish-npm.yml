@@ -45,8 +45,8 @@ jobs:
           mv tpt-log-wasm/dist/optimized.d.ts tpt-log-wasm/dist/tpt_log_wasm.d.ts
           mv tpt-log-wasm/dist/optimized_bg.wasm.d.ts tpt-log-wasm/dist/tpt_log_wasm_bg.wasm.d.ts
           mv tpt-log-wasm/dist/optimized.js tpt-log-wasm/dist/tpt_log_wasm.js
-      - name: Copy README into package
-        run: cp README.md tpt-log-wasm/README.md
+      # tpt-log-wasm/README.md and CHANGELOG.md are committed per-crate docs and
+      # are published as-is; do not overwrite them with the workspace overview.
       - uses: actions/upload-artifact@v4
         with:
           name: npm-package

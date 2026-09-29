@@ -185,14 +185,30 @@ Remaining resource targets (validated by design and covered by tests, not yet tr
 
 | Path | Purpose |
 | --- | --- |
-| `tpt-log-core/` | Pure Rust engine: lock-free queue, batching, zstd, WAL, retry, filtering/sampling/enrichment |
-| `tpt-log-transport/` | HTTP, Datadog/Elasticsearch/CloudWatch/Prometheus adapters, gRPC (OTLP), UDP, TCP, rotating JSONL file |
-| `tpt-log-ffi/` | C ABI boundary (`include/tpt_microlog.h`) for C/C++/Go consumers |
-| `tpt-log-py/` | PyO3 wrapper shipped to PyPI as `tpt-microlog` (maturin, abi3 3.9+) |
-| `tpt-log-wasm/` | Self-contained wasm-bindgen wrapper shipped to npm as `tpt-microlog` |
-| `tpt-log-go/` | cgo wrapper module (`github.com/tpt-solutions/tpt-microlog-go`) |
+| [`tpt-log-core/`](tpt-log-core/) | Pure Rust engine: lock-free queue, batching, zstd, WAL, retry, filtering/sampling/enrichment |
+| [`tpt-log-transport/`](tpt-log-transport/) | HTTP, Datadog/Elasticsearch/CloudWatch/Prometheus adapters, gRPC (OTLP), UDP, TCP, rotating JSONL file |
+| [`tpt-log-ffi/`](tpt-log-ffi/) | C ABI boundary (`include/tpt_microlog.h`) for C/C++/Go consumers |
+| [`tpt-log-py/`](tpt-log-py/) | PyO3 wrapper shipped to PyPI as `tpt-microlog` (maturin, abi3 3.9+) |
+| [`tpt-log-wasm/`](tpt-log-wasm/) | Self-contained wasm-bindgen wrapper shipped to npm as `tpt-microlog` |
+| [`tpt-log-go/`](tpt-log-go/) | cgo wrapper module (`github.com/tpt-solutions/tpt-microlog-go`) |
 | `examples/` | Runnable examples for Python, JavaScript/Node, Go, and C |
 | `.github/workflows/` | CI (deny/clippy/test/fmt/wasm) and PyPI/npm publish pipelines |
+
+### Per-crate documentation
+
+Each package carries its own README and CHANGELOG:
+
+| Crate | Docs | Changelog |
+| --- | --- | --- |
+| `tpt-log-core` | [README](tpt-log-core/README.md) | [CHANGELOG](tpt-log-core/CHANGELOG.md) |
+| `tpt-log-transport` | [README](tpt-log-transport/README.md) | [CHANGELOG](tpt-log-transport/CHANGELOG.md) |
+| `tpt-log-ffi` | [README](tpt-log-ffi/README.md) | [CHANGELOG](tpt-log-ffi/CHANGELOG.md) |
+| `tpt-log-py` | [README](tpt-log-py/README.md) | [CHANGELOG](tpt-log-py/CHANGELOG.md) |
+| `tpt-log-wasm` | [README](tpt-log-wasm/README.md) | [CHANGELOG](tpt-log-wasm/CHANGELOG.md) |
+| `tpt-log-go` | [README](tpt-log-go/README.md) | [CHANGELOG](tpt-log-go/CHANGELOG.md) |
+
+Release notes that affect several crates are summarized in the section above;
+consult the individual changelogs for crate-specific detail.
 
 ## License
 

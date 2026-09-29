@@ -96,3 +96,131 @@
 - [x] Implement "fast mode": disable zstd compression for extreme throughput (> 1M logs/sec)
 - [x] Run performance benchmarks: validate > 100,000 logs/sec throughput, < 20 MB RAM, < 2% CPU (~450k logs/sec measured; see README)
 - [x] Publish benchmark results to README
+
+---
+
+## Phase 9 — Reliability Hardening (from platform review)
+
+### WAL & delivery
+- [ ] WAL: namespace dir by hash(service+backend+endpoint); add lock file so processes never replay each other's batches
+- [ ] WAL: unique filenames (pid + random) and atomic write (temp file + rename)
+- [ ] WAL: dead-letter dir (`wal/dead/`) after N failed replays; per-file attempt counter
+- [ ] WAL: O(1) size accounting (stop re-listing dir on every write); stream `pending()` instead of loading all files
+- [ ] WAL: persist `entry_count` so `Stats.retried_entries` is correct
+- [ ] `shutdown()`/`Drop`: add `shutdown_timeout_ms`; spill remaining batches to WAL on expiry (never hang the host app)
+- [ ] Replay: stop pass at first failure (circuit breaker) or move to separate thread so live delivery is never blocked
+- [ ] Queue overflow policy: `block | drop_newest | drop_oldest` + `dropped_entries` stat
+- [ ] Supervise batcher/delivery threads (panic recovery, no `unwrap`/`expect` in worker paths)
+- [ ] Optional `durability = "wal-first"` mode; reword README "100% delivery" claim to at-least-once on graceful shutdown
+
+### Retry & classification
+- [ ] Treat HTTP 408/425/429 as transient; honor `Retry-After`
+- [ ] Fix backoff off-by-one (first retry currently immediate) and add jitter
+- [ ] Remove dead duplicate `deliver_with_retry` in `retry.rs`
+
+### Config & security
+- [ ] Surface `tpt-log.toml` parse errors instead of silently defaulting; warn on unknown keys (`deny_unknown_fields`)
+- [ ] Fix README sample config (`[endpoint]` table breaks parsing)
+- [ ] Redact secrets in `Debug`/`Serialize` (`Secret<String>` for `api_key`, `aws_secret_key`)
+- [ ] Only expand leading `~/` in `wal_dir` (currently corrupts Windows 8.3 paths)
+- [ ] `host_and_process()` must return real hostname, not `service`; implement env-var enrichment
+- [ ] Expand env-var coverage: FILE_PATH, NET_ENDPOINT, GRPC_ENDPOINT, AWS_*, EXTRA_HEADERS, PROMETHEUS_BIND, QUEUE_CAPACITY, WAL_RETRY_INTERVAL_MS, `TPT_LOG_CONFIG`
+
+### Filtering
+- [ ] Metrics/traces bypass `min_level` and sampling
+- [ ] Per-level sampling map; never sample WARN and above
+- [ ] `is_enabled()` should account for regex/tag filters
+
+### Bindings
+- [ ] FFI/C: fix `wal_enabled` tri-state (zero-init must mean default, not off)
+- [ ] Go: fix `WalEnabled:false` (currently sends "default" = on); add `WalDir`, `CompressionLevel`
+- [ ] Go: `sync.RWMutex` around handle (Close race) and `runtime.LockOSThread` around `lastError()`
+- [ ] FFI: add `tpt_log_log_json()` for nested metadata; wrap all entry points in `catch_unwind`
+- [ ] Python: release GIL (`allow_threads`) on blocking calls; never raise on NaN/Inf metadata
+- [ ] Python: `flush()`, context manager, `atexit` shutdown hook, `os.register_at_fork` handling
+- [ ] Expose `stats()` and `flush()` in every binding (Py/JS/Go/C)
+
+### Hot path performance
+- [ ] Remove 3x entry copy (processor clone -> Arc -> batch clone); make `process(&mut entry)`
+- [ ] Remove global `Mutex<usize>` from queue push/pop (and dead `buffered` counter)
+- [ ] Carry entries/raw JSON with `CompressedBatch` to avoid decompress -> parse -> re-serialize in every adapter
+- [ ] `approx_size` should account for real metadata value sizes
+- [ ] Re-run throughput benchmark; record RSS/CPU so README targets are measured
+
+### Regression tests
+- [ ] Backend down + `shutdown()` returns within timeout
+- [ ] 429 retried; 400 dead-lettered after N replays
+- [ ] Two instances with different services never cross-deliver WAL files
+- [ ] Queue full + `drop_newest` never blocks `info()`
+- [ ] `sample_rate`/`min_level` leave metrics and ERRORs intact
+- [ ] Python: NaN metadata, GIL release, fork; Go: `go test`; WASM: 4xx head-of-line case
+
+## Phase 10 — Adapter Correctness
+
+- [ ] HTTP/custom backend: default to plain JSON body; zstd/gzip opt-in
+- [ ] Prometheus: key samples by name + label set; escape label values; sanitize label keys; one `# TYPE` per metric; stoppable listener
+- [ ] Datadog: send metadata as top-level attributes (not `ddtags`); `site` option; split requests at 1000 entries / 5 MB; optional Metrics API for `metric()`
+- [ ] Elasticsearch: sane default index (not hostname, lowercase); parse bulk `errors:true` responses; basic-auth / API-key options; retry on 429
+- [ ] CloudWatch: include metadata in message; sort events by timestamp; enforce 10k events / 1 MB / 14-day limits; session token + env/IAM credentials; optional auto-create group/stream
+- [ ] UDP: add batch id to frame header; correct compressed flag; MTU-safe chunk size (~1200-1400 B)
+- [ ] TCP: write timeout; compressed flag in frame; optional ack; remove `expect` panics
+- [ ] WASM: distinguish transient/permanent errors, cap retries (fix 4xx head-of-line blocking)
+- [ ] WASM: use `fetch(..., { keepalive: true })` instead of `sendBeacon` when headers are needed
+- [ ] WASM: emit Datadog-format payload for `backend: "datadog"`; document "never ship API keys in browser bundles"
+- [ ] WASM: publish feature-parity table vs native (filters, enrichment, compression, default min level)
+
+## Phase 11 — Adoption & Usability
+
+### Onboarding
+- [ ] `console`/`stdout` backend (pretty on TTY, JSON lines when piped); make it the default with a startup banner
+- [ ] Named presets (`dev`, `prod`, `datadog-eu`, `elastic-cloud`, `grafana-loki`, `otel-collector`, `cloudwatch-lambda`) with actionable validation errors
+- [ ] `tpt-microlog` CLI: `init`, `doctor` (config/DNS/TLS/auth/WAL checks), `wal ls|replay|purge|dead`, `tail`, `send-test`
+- [ ] Config search paths (`./`, `~/.config/tpt-microlog/`, `/etc/`) + `TPT_LOG_CONFIG`
+- [ ] JSON Schema for `tpt-log.toml`; "did you mean...?" hints for unknown keys; complete `.pyi`
+- [ ] `on_error` callback / internal diagnostics channel so failures are never silent
+
+### Integrations
+- [ ] Python `logging.Handler`
+- [ ] Go `slog.Handler`
+- [ ] Rust `tracing` Layer and `log` facade; panic hook; builder API; structured log macro
+- [ ] Node/pino or console transport
+- [ ] Multi-backend fan-out and failover routing
+- [ ] TLS/proxy config (`ca_cert`, `proxy`); OTLP/HTTP; Loki; Splunk HEC
+
+### Examples & templates
+- [ ] `examples/stacks/`: ELK, Loki+Grafana, OTel Collector, Prometheus+Grafana (docker-compose + dashboards)
+- [ ] `examples/frameworks/`: FastAPI, Flask, Django, Express, Next.js, Gin, net/http, Axum, AWS Lambda, Cloudflare Worker, CLI tool
+- [ ] `examples/recipes/`: request-id correlation, PII redaction, sampling noisy DEBUG, offline-first WAL demo, migration from logging/winston/zap
+- [ ] Starter templates per language (cookiecutter/degit), GitHub template repo, `.env.example`, Dockerfile + K8s ConfigMap/Helm snippets
+- [ ] `tpt-log.toml` gallery in `docs/`
+
+### Distribution & docs
+- [ ] Go: prebuilt static libs (linux/mac/win x amd64/arm64) as release assets + fetcher; split module to resolve registry publishing
+- [ ] Publish `tpt-log-core` / `tpt-log-transport` to crates.io
+- [ ] Release automation (release-please/cargo-dist), changelog, Sigstore signing, SBOM
+- [ ] Docs site (mdBook/Docusaurus): quickstarts, backend cookbook, "delivery guarantees explained", troubleshooting, benchmark methodology
+- [ ] README: badges, 30-second demo GIF, corrected delivery-guarantee wording
+- [ ] `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, issue/PR templates, `CHANGELOG.md`
+
+## Phase 12 — Differentiators (pick 2-3)
+
+- [ ] PII/secret redaction (`redact` keys + regex + built-in detectors) applied before WAL and network
+- [ ] Adaptive sampling under pressure (always keep WARN+)
+- [ ] Burst dedup / rate limiting with `repeat_count`
+- [ ] Error-triggered "flight recorder" (ship buffered DEBUG context only on ERROR/FATAL)
+- [ ] Daily volume/cost budget with auto-tightening sampling
+- [ ] Automatic trace correlation (W3C `traceparent` / OTel context) + span guard/context manager
+- [ ] Self-telemetry (`queue_depth`, `wal_bytes`, `dropped`, latency) + `/healthz`
+- [ ] WAL query/inspection + redacted support bundle export
+- [ ] `tpt-microlog-agent` sidecar (UDP/Unix socket/HTTP) for languages without bindings
+- [ ] Edge/WASM extras: Cloudflare Worker/Vercel Edge build, browser error auto-capture, IndexedDB offline queue
+- [ ] Schema-aware typed events
+
+## CI & Repo Hygiene
+
+- [ ] Real OS matrix (ubuntu/macos/windows); fix `--target` so the windows-gnu leg actually cross-builds
+- [ ] Add Python (`maturin develop` + `pytest`), Go (`go test`), and Node/WASM smoke-test jobs
+- [ ] MSRV job
+- [ ] Benchmark job that fails on >20% throughput regression
+- [ ] Dependabot/renovate
+- [ ] Verify `wasm-opt -Oz` actually runs in `publish-npm.yml`

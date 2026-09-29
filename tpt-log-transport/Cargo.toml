@@ -6,6 +6,11 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Transport layer for tpt-microlog: HTTP/gRPC/UDP/TCP/file, backend adapters, retry + WAL integration."
+readme = "README.md"
+homepage = "https://github.com/tpt-solutions/tpt-microlog/tree/master/tpt-log-transport"
+documentation = "https://docs.rs/tpt-log-transport"
+keywords = ["logging", "telemetry", "opentelemetry", "datadog", "transport"]
+categories = ["network-programming", "development-tools::debugging", "asynchronous", "web-programming::http-client", "api-bindings"]
 
 [dependencies]
 tpt-log-core = { path = "../tpt-log-core", version = "0.1.0" }

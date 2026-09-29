@@ -6,6 +6,11 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Core logging engine for tpt-microlog: lock-free queue, batching, compression, WAL, retry."
+readme = "README.md"
+homepage = "https://github.com/tpt-solutions/tpt-microlog/tree/master/tpt-log-core"
+documentation = "https://docs.rs/tpt-log-core"
+keywords = ["logging", "telemetry", "batching", "wal", "zstd"]
+categories = ["development-tools::debugging", "asynchronous", "compression", "concurrency", "filesystem"]
 
 [dependencies]
 serde = { workspace = true }

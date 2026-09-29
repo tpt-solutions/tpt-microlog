@@ -6,6 +6,11 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "WASM wrapper for tpt-microlog (wasm-bindgen): batching, fetch transport, sendBeacon fallback."
+readme = "README.md"
+homepage = "https://github.com/tpt-solutions/tpt-microlog/tree/master/tpt-log-wasm"
+documentation = "https://docs.rs/tpt-log-wasm"
+keywords = ["logging", "telemetry", "wasm", "browser", "datadog"]
+categories = ["api-bindings", "development-tools::debugging", "wasm", "web-programming", "network-programming"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
