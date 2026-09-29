@@ -1,6 +1,5 @@
 /target
 /dist
-Cargo.lock
 
 # Python build artifacts
 *.egg-info/
@@ -11,6 +10,7 @@ __pycache__/
 
 # WASM build artifacts
 pkg/
+tpt-log-wasm/dist/
 *.wasm
 
 # WAL data
@@ -29,3 +29,6 @@ Thumbs.db
 # Env
 .env
 *.env.local
+
+# Go test binaries
+*.test

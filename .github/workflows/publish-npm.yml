@@ -1,0 +1,75 @@
+name: Publish WASM (npm)
+
+on:
+  push:
+    tags:
+      - "npm-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build WASM package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release WASM
+        run: cargo build --release -p tpt-log-wasm --target wasm32-unknown-unknown
+      - name: Size budget (spec: < 3 MB)
+        run: |
+          size=$(stat -c %s target/wasm32-unknown-unknown/release/tpt_log_wasm.wasm)
+          echo "wasm size: $size bytes"
+          [ "$size" -lt 3145728 ] || {
+            echo "WASM binary exceeds the 3 MB budget"; exit 1; }
+      - name: Install wasm-bindgen CLI
+        uses: jetli/wasm-bindgen-action@v0.2.0
+        with:
+          version: "0.2.129"
+      - name: Install binaryen (wasm-opt)
+        uses: jetli/binaryen-action@v0.4.0
+        with:
+          version: "latest"
+      - name: Optimize binary and generate JS glue
+        run: |
+          wasm-opt -Oz -o optimized.wasm \
+            target/wasm32-unknown-unknown/release/tpt_log_wasm.wasm
+          mkdir -p tpt-log-wasm/dist
+          wasm-bindgen --target web --out-dir tpt-log-wasm/dist optimized.wasm
+          mv tpt-log-wasm/dist/optimized_bg.wasm tpt-log-wasm/dist/tpt_log_wasm_bg.wasm
+          mv tpt-log-wasm/dist/optimized.d.ts tpt-log-wasm/dist/tpt_log_wasm.d.ts
+          mv tpt-log-wasm/dist/optimized_bg.wasm.d.ts tpt-log-wasm/dist/tpt_log_wasm_bg.wasm.d.ts
+          mv tpt-log-wasm/dist/optimized.js tpt-log-wasm/dist/tpt_log_wasm.js
+      - name: Copy README into package
+        run: cp README.md tpt-log-wasm/README.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-package
+          path: tpt-log-wasm
+
+  publish:
+    name: Publish to npm
+    needs: [build]
+    runs-on: ubuntu-latest
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/tpt-microlog
+    permissions:
+      id-token: write # npm provenance (OIDC)
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-package
+          path: pkg
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - run: npm publish pkg --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

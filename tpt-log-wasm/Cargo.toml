@@ -1,0 +1,24 @@
+[package]
+name = "tpt-log-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "WASM wrapper for tpt-microlog (wasm-bindgen): batching, fetch transport, sendBeacon fallback."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# Self-contained: the native core depends on threads, a disk WAL, and a
+# blocking HTTP stack that do not exist in a browser (spec §9).
+[dependencies]
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = "0.4"
+js-sys = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dependencies.web-sys]
+workspace = true
+features = ["Window", "Headers", "Request", "RequestInit", "Response", "Navigator"]

@@ -1,0 +1,37 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "tpt-microlog"
+description = "The microscopic telemetry & log router. Guaranteed delivery, zero infrastructure."
+readme = "../README.md"
+license = { text = "MIT OR Apache-2.0" }
+authors = [{ name = "TPT Solutions" }]
+requires-python = ">=3.9"
+keywords = ["logging", "metrics", "telemetry", "observability", "datadog"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: System :: Logging",
+]
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/tpt-solutions/tpt-microlog"
+
+[tool.maturin]
+python-source = "python"
+module-name = "tpt_microlog._native"
+features = ["pyo3"]
+strip = true

@@ -1,0 +1,30 @@
+{
+  "name": "tpt-microlog",
+  "version": "0.1.0",
+  "description": "The microscopic telemetry & log router. Guaranteed delivery, zero infrastructure.",
+  "license": "(MIT OR Apache-2.0)",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tpt-solutions/tpt-microlog"
+  },
+  "authors": ["TPT Solutions"],
+  "keywords": [
+    "logging",
+    "metrics",
+    "telemetry",
+    "observability",
+    "wasm",
+    "browser"
+  ],
+  "type": "module",
+  "main": "dist/tpt_log_wasm.js",
+  "types": "index.d.ts",
+  "files": [
+    "dist",
+    "index.d.ts",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

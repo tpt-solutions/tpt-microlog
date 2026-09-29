@@ -1,0 +1,50 @@
+//! `tpt-log-core` — the microscopic telemetry & log router core.
+//!
+//! Pure-Rust logging engine providing a lock-free ingestion queue, background
+//! batching, zstd compression, a write-ahead log, and exponential-backoff
+//! retry. Network transports live in `tpt-log-transport` and plug in through
+//! the [`Transport`] trait.
+
+pub mod batch;
+pub mod config;
+pub mod entry;
+pub mod filter;
+pub mod level;
+pub mod log_type;
+pub mod microlog;
+pub mod queue;
+pub mod retry;
+pub mod transport;
+pub mod wal;
+
+pub use batch::{Batch, CompressedBatch, Compressor};
+pub use config::Config;
+pub use entry::LogEntry;
+pub use level::LogLevel;
+pub use log_type::LogType;
+pub use microlog::MicroLog;
+pub use transport::{NullTransport, Transport, TransportError};
+
+/// Default end-of-file batching constants (spec §5.2).
+pub mod defaults {
+    /// Flush when the batch reaches this many entries.
+    pub const BATCH_SIZE: usize = 100;
+    /// Flush at least this often (milliseconds).
+    pub const FLUSH_INTERVAL_MS: u64 = 1_000;
+    /// Flush when in-memory bytes cross this threshold.
+    pub const MEMORY_LIMIT_BYTES: usize = 10 * 1024 * 1024;
+    /// Bounded ingestion queue capacity.
+    pub const QUEUE_CAPACITY: usize = 10_000;
+    /// zstd compression level (spec §5.2).
+    pub const COMPRESSION_LEVEL: i32 = 3;
+    /// Exponential-backoff base delay (milliseconds).
+    pub const RETRY_BASE_MS: u64 = 1_000;
+    /// Maximum backoff delay (milliseconds).
+    pub const RETRY_MAX_BACKOFF_MS: u64 = 60_000;
+    /// Maximum delivery attempts.
+    pub const MAX_RETRIES: u32 = 10;
+    /// Default WAL size cap (bytes).
+    pub const WAL_MAX_SIZE_BYTES: u64 = 100 * 1024 * 1024;
+    /// How often the WAL retry thread re-attempts delivery.
+    pub const WAL_RETRY_INTERVAL_MS: u64 = 5_000;
+}

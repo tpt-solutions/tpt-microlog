@@ -1,0 +1,22 @@
+[package]
+name = "tpt-log-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Python wrapper for tpt-microlog (PyO3)."
+
+[lib]
+name = "tpt_log_py"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+tpt-log-core = { path = "../tpt-log-core", version = "0.1.0" }
+tpt-log-transport = { path = "../tpt-log-transport", version = "0.1.0" }
+pyo3 = { workspace = true, optional = true }
+serde_json = { workspace = true }
+
+[features]
+default = ["pyo3"]
+pyo3 = ["dep:pyo3"]

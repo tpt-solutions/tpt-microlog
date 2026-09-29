@@ -1,0 +1,17 @@
+[package]
+name = "tpt-log-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "C ABI boundary for tpt-microlog: opaque handles and error codes."
+
+[lib]
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+tpt-log-core = { path = "../tpt-log-core", version = "0.1.0" }
+tpt-log-transport = { path = "../tpt-log-transport", version = "0.1.0" }
+parking_lot = { workspace = true }
+serde_json = { workspace = true }
