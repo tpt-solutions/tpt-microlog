@@ -159,7 +159,7 @@ fn cloudwatch_adapter_signs_put_log_events() {
     let cfg = Config {
         aws_region: Some("eu-central-1".into()),
         aws_access_key: Some("AKIDTEST".into()),
-        aws_secret_key: Some("SECRETTEST".into()),
+        aws_secret_key: Some(tpt_log_core::Secret::new("SECRETTEST")),
         aws_log_group: Some("my-group".into()),
         aws_log_stream: Some("my-stream".into()),
         ..slim_config("cloudwatch", &mock.addr)
@@ -214,6 +214,7 @@ fn prometheus_adapter_serves_metrics_via_pull() {
             bytes: serde_json::to_vec(&tpt_log_core::Batch { entries }).unwrap(),
             entry_count: 2,
             compressed: false,
+            raw_json: None,
         },
     };
     adapter.send(&batch).unwrap();

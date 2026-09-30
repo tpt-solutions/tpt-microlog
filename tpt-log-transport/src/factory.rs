@@ -66,13 +66,12 @@ impl HttpTransport {
             }
         }
 
-        let mode = if config.fast_mode {
-            // Fast mode yields uncompressed payloads; send raw JSON so the
-            // receiver can parse it directly.
-            BodyMode::Json
-        } else {
-            // Default: stream the compressed bytes with `Content-Encoding: zstd`.
-            BodyMode::Zstd
+        // Plain JSON is the default so any receiver can consume it; zstd
+        // bodies are opt-in (`body_mode = "zstd"`). `fast_mode` implies JSON
+        // (its payloads are already uncompressed).
+        let mode = match (config.body_mode, config.fast_mode) {
+            (_, true) | (tpt_log_core::BodyMode::Json, false) => BodyMode::Json,
+            (tpt_log_core::BodyMode::Zstd, false) => BodyMode::Zstd,
         };
         Ok(Self::with_mode(url, headers, mode))
     }
@@ -100,6 +99,7 @@ mod tests {
                 bytes: b"{}".to_vec(),
                 entry_count: 0,
                 compressed: false,
+                raw_json: None,
             },
         }
     }

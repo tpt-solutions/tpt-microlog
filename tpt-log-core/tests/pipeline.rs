@@ -80,17 +80,26 @@ fn failed_delivery_lands_in_wal_and_is_retried() {
     cfg.max_retries = 1;
     cfg.retry_base_ms = 5;
     cfg.wal_retry_interval_ms = 20;
-    let wal_dir = cfg.resolved_wal_dir();
+    // WAL files live in a per-identity namespace directory.
+    let wal_dir = cfg.resolved_wal_dir().join(tpt_log_core::wal::namespace(
+        cfg.service.as_deref(),
+        &cfg.backend,
+        cfg.endpoint.as_deref(),
+    ));
 
     let failing = Arc::new(FailingTransport::default());
     let log = MicroLog::new(cfg.clone(), failing.clone());
 
     log.info("must survive a network outage");
     log.shutdown();
+    let stats = log.stats();
+    let wal_writes = stats.wal_writes.load(AtomicOrder::SeqCst);
+    let delivered = stats.delivered_batches.load(AtomicOrder::SeqCst);
+    drop(log); // release the WAL directory lock
 
     // Batch could not be delivered → must be persisted in the WAL.
-    assert_eq!(log.stats().wal_writes.load(AtomicOrder::SeqCst), 1);
-    assert_eq!(log.stats().delivered_batches.load(AtomicOrder::SeqCst), 0);
+    assert_eq!(wal_writes, 1);
+    assert_eq!(delivered, 0);
 
     let files: Vec<_> = std::fs::read_dir(&wal_dir).unwrap().flatten().collect();
     assert!(!files.is_empty(), "WAL must contain the undelivered batch");
@@ -107,7 +116,11 @@ fn failed_delivery_lands_in_wal_and_is_retried() {
             .any(|e| e.message == "must survive a network outage"),
         "WAL replay must redeliver the batch"
     );
-    let remaining: Vec<_> = std::fs::read_dir(&wal_dir).unwrap().flatten().collect();
+    let remaining: Vec<_> = std::fs::read_dir(&wal_dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().is_file() && e.path().extension().is_some_and(|x| x == "wal"))
+        .collect();
     assert!(remaining.is_empty(), "delivered WAL files must be removed");
 }
 

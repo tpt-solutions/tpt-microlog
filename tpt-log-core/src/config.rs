@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::defaults;
@@ -26,6 +27,192 @@ pub mod backend {
     pub const TCP: &str = "tcp";
     /// Local JSONL file.
     pub const FILE: &str = "file";
+}
+
+/// Wrapper for credential material that never leaks through `Debug` or
+/// `Serialize` (both render `"[redacted]"`). Deserialize from plain text;
+/// read back with [`Secret::expose`] only where the value is actually used.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(String);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(\"[redacted]\")")
+    }
+}
+
+impl Serialize for Secret {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str("[redacted]")
+    }
+}
+
+impl<'de> Deserialize<'de> for Secret {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(Secret)
+    }
+}
+
+impl From<String> for Secret {
+    fn from(value: String) -> Self {
+        Secret(value)
+    }
+}
+
+impl From<&str> for Secret {
+    fn from(value: &str) -> Self {
+        Secret(value.to_string())
+    }
+}
+
+impl Secret {
+    pub fn new(value: impl Into<String>) -> Self {
+        Secret(value.into())
+    }
+
+    /// The underlying credential. Call sites must avoid logging it.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+/// How the generic HTTP backend encodes request bodies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum BodyMode {
+    /// POST the reconstructed JSON batch: `{"entries":[...]}` (default).
+    #[default]
+    Json,
+    /// POST the raw compressed bytes with `Content-Encoding: zstd`.
+    Zstd,
+}
+
+impl std::fmt::Display for BodyMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            BodyMode::Json => "json",
+            BodyMode::Zstd => "zstd",
+        })
+    }
+}
+
+impl std::str::FromStr for BodyMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "json" => Ok(BodyMode::Json),
+            "zstd" => Ok(BodyMode::Zstd),
+            other => Err(format!("unknown body_mode '{other}' (expected json, zstd)")),
+        }
+    }
+}
+
+impl Serialize for BodyMode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for BodyMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// What to do when the ingestion queue is full (spec §2.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum QueueFullPolicy {
+    /// Block the producer until space is available (never drops).
+    #[default]
+    Block,
+    /// Drop the entry being pushed; the queue keeps its oldest entries.
+    DropNewest,
+    /// Evict the oldest buffered entry to make room for the new one.
+    DropOldest,
+}
+
+impl std::fmt::Display for QueueFullPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            QueueFullPolicy::Block => "block",
+            QueueFullPolicy::DropNewest => "drop_newest",
+            QueueFullPolicy::DropOldest => "drop_oldest",
+        })
+    }
+}
+
+impl std::str::FromStr for QueueFullPolicy {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "block" => Ok(QueueFullPolicy::Block),
+            "drop_newest" | "drop-newest" => Ok(QueueFullPolicy::DropNewest),
+            "drop_oldest" | "drop-oldest" => Ok(QueueFullPolicy::DropOldest),
+            other => Err(format!(
+                "unknown queue_full_policy '{other}' (expected block, drop_newest, drop_oldest)"
+            )),
+        }
+    }
+}
+
+impl Serialize for QueueFullPolicy {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for QueueFullPolicy {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// How eagerly batches are persisted before delivery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Durability {
+    /// WAL is only written after delivery attempts are exhausted (default).
+    #[default]
+    BestEffort,
+    /// Every batch is written to the WAL *before* the first delivery attempt;
+    /// the WAL entry is removed on success. Survives an abrupt process kill
+    /// at the cost of one disk write per batch.
+    WalFirst,
+}
+
+impl std::fmt::Display for Durability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Durability::BestEffort => "best-effort",
+            Durability::WalFirst => "wal-first",
+        })
+    }
+}
+
+impl std::str::FromStr for Durability {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "best-effort" | "best_effort" => Ok(Durability::BestEffort),
+            "wal-first" | "wal_first" => Ok(Durability::WalFirst),
+            other => Err(format!(
+                "unknown durability '{other}' (expected best-effort, wal-first)"
+            )),
+        }
+    }
+}
+
+impl Serialize for Durability {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for Durability {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
 }
 
 /// Parsed WAL directory root (from file/env overrides).
@@ -73,8 +260,8 @@ pub struct Config {
     pub backend: String,
     /// Base URL / address for the chosen backend.
     pub endpoint: Option<String>,
-    /// Secret token (Datadog `DD-API-KEY`, etc.).
-    pub api_key: Option<String>,
+    /// Secret token (Datadog `DD-API-KEY`, etc.). Redacted in Debug/serde.
+    pub api_key: Option<Secret>,
     /// Extra HTTP headers as `name=value` entries.
     pub extra_headers: Vec<String>,
     /// gRPC channel target in `host:port` form.
@@ -94,9 +281,32 @@ pub struct Config {
     /// CloudWatch Logs configuration.
     pub aws_region: Option<String>,
     pub aws_access_key: Option<String>,
-    pub aws_secret_key: Option<String>,
+    /// Redacted in Debug/serde.
+    pub aws_secret_key: Option<Secret>,
     pub aws_log_group: Option<String>,
     pub aws_log_stream: Option<String>,
+    /// STS session token for temporary credentials. Redacted in Debug/serde.
+    pub aws_session_token: Option<Secret>,
+    /// Create the log group/stream on first send when they do not exist.
+    pub aws_auto_create_stream: bool,
+
+    /// Datadog site (e.g. `datadoghq.eu`, `us5.datadoghq.com`); the intake
+    /// endpoint becomes `https://http-intake.logs.<site>/api/v2/logs`.
+    pub datadog_site: Option<String>,
+    /// Ship `metric()` entries through the Datadog Metrics API as well.
+    pub datadog_metrics: bool,
+
+    /// Explicit Elasticsearch index name (default `tpt-microlog`).
+    pub es_index: Option<String>,
+    /// HTTP basic auth as `user:password` (Elasticsearch). Redacted.
+    pub es_basic_auth: Option<Secret>,
+
+    /// How the generic HTTP backend encodes the body: `json` (default) or
+    /// `zstd` (opt-in compressed bytes with `Content-Encoding: zstd`).
+    pub body_mode: BodyMode,
+
+    /// Ask the TCP receiver for a 1-byte ack after each frame.
+    pub tcp_ack: bool,
 
     /// Flush batch at this many entries.
     pub batch_size: usize,
@@ -106,6 +316,8 @@ pub struct Config {
     pub memory_limit_bytes: usize,
     /// Ingestion queue capacity.
     pub queue_capacity: usize,
+    /// Behavior when the ingestion queue is full.
+    pub queue_full_policy: QueueFullPolicy,
     /// zstd compression level.
     pub compression_level: i32,
     /// Disable compression for extreme throughput ("fast mode", spec §9).
@@ -117,6 +329,8 @@ pub struct Config {
     pub retry_base_ms: u64,
     /// Backoff ceiling (ms).
     pub retry_max_backoff_ms: u64,
+    /// `Retry-After` responses are honored up to this cap (ms).
+    pub retry_after_max_ms: u64,
 
     /// Enable write-ahead log persistence.
     pub wal_enabled: bool,
@@ -126,13 +340,26 @@ pub struct Config {
     pub wal_max_size_bytes: u64,
     /// WAL retry poll interval (ms).
     pub wal_retry_interval_ms: u64,
+    /// Move a WAL file to `wal/dead/` after this many failed replay passes.
+    pub wal_dead_letter_replays: u32,
+    /// Write every batch to the WAL before the first delivery attempt.
+    pub durability: Durability,
 
-    /// Attach hostname / PID / service to every entry (spec §8).
+    /// Hard budget for `shutdown()`; remaining batches spill to the WAL when
+    /// it expires so the host app is never hung by the logger.
+    pub shutdown_timeout_ms: u64,
+
+    /// Attach hostname / PID / service / env vars to every entry (spec §8).
     pub enrichment: bool,
+    /// Environment variable names captured into enriched entries.
+    pub enrich_env_vars: Vec<String>,
     /// Drop entries below this level.
     pub min_level: Option<String>,
     /// Percent of logs to deliver (0.0 - 1.0, spec §8).
     pub sample_rate: f64,
+    /// Per-level sampling overrides (level name → rate), e.g.
+    /// `[sample_rate_by_level]\nDEBUG = 0.1`. WARN and above are never sampled.
+    pub sample_rate_by_level: BTreeMap<String, f64>,
     /// Drop entries carrying any of these `tag=value` pairs (spec §8).
     pub filter_tags: Vec<String>,
     /// Drop entries whose message matches this regex (spec §8).
@@ -163,22 +390,37 @@ impl Default for Config {
             aws_secret_key: None,
             aws_log_group: None,
             aws_log_stream: None,
+            aws_session_token: None,
+            aws_auto_create_stream: false,
+            datadog_site: None,
+            datadog_metrics: false,
+            es_index: None,
+            es_basic_auth: None,
+            body_mode: BodyMode::Json,
+            tcp_ack: false,
             batch_size: defaults::BATCH_SIZE,
             flush_interval_ms: defaults::FLUSH_INTERVAL_MS,
             memory_limit_bytes: defaults::MEMORY_LIMIT_BYTES,
             queue_capacity: defaults::QUEUE_CAPACITY,
+            queue_full_policy: QueueFullPolicy::Block,
             compression_level: defaults::COMPRESSION_LEVEL,
             fast_mode: false,
             max_retries: defaults::MAX_RETRIES,
             retry_base_ms: defaults::RETRY_BASE_MS,
             retry_max_backoff_ms: defaults::RETRY_MAX_BACKOFF_MS,
+            retry_after_max_ms: defaults::RETRY_AFTER_MAX_MS,
             wal_enabled: true,
             wal_dir: default_wal_dir().to_string_lossy().to_string(),
             wal_max_size_bytes: defaults::WAL_MAX_SIZE_BYTES,
             wal_retry_interval_ms: defaults::WAL_RETRY_INTERVAL_MS,
+            wal_dead_letter_replays: defaults::WAL_DEAD_LETTER_REPLAYS,
+            durability: Durability::BestEffort,
+            shutdown_timeout_ms: defaults::SHUTDOWN_TIMEOUT_MS,
             enrichment: false,
+            enrich_env_vars: Vec::new(),
             min_level: None,
             sample_rate: 1.0,
+            sample_rate_by_level: BTreeMap::new(),
             filter_tags: Vec::new(),
             filter_regex: None,
             wal_frame_newline: true,
@@ -186,21 +428,171 @@ impl Default for Config {
     }
 }
 
+/// Configuration file names/locations searched when `TPT_LOG_CONFIG` is unset.
+const CONFIG_FILE_NAME: &str = "tpt-log.toml";
+
+/// Candidate config paths in increasing precedence: current directory, user
+/// config dir, then system config dir.
+fn config_search_paths() -> Vec<PathBuf> {
+    let mut paths = vec![PathBuf::from(CONFIG_FILE_NAME)];
+    if let Some(home) = home_dir_var() {
+        let mut user = home;
+        if cfg!(windows) {
+            user.push("tpt-microlog");
+        } else {
+            user.push(".config");
+            user.push("tpt-microlog");
+        }
+        paths.push(user.join(CONFIG_FILE_NAME));
+    }
+    paths.push(PathBuf::from("/etc/tpt-microlog").join(CONFIG_FILE_NAME));
+    paths
+}
+
+/// Top-level field names accepted in `tpt-log.toml`; anything else triggers a
+/// warning so typos never silently disable a feature.
+const KNOWN_CONFIG_KEYS: &[&str] = &[
+    "service",
+    "backend",
+    "endpoint",
+    "api_key",
+    "extra_headers",
+    "grpc_endpoint",
+    "net_endpoint",
+    "file_path",
+    "file_rotation_bytes",
+    "file_rotation_seconds",
+    "file_rotations",
+    "prometheus_bind",
+    "aws_region",
+    "aws_access_key",
+    "aws_secret_key",
+    "aws_log_group",
+    "aws_log_stream",
+    "aws_session_token",
+    "aws_auto_create_stream",
+    "datadog_site",
+    "datadog_metrics",
+    "es_index",
+    "es_basic_auth",
+    "body_mode",
+    "tcp_ack",
+    "batch_size",
+    "flush_interval_ms",
+    "memory_limit_bytes",
+    "queue_capacity",
+    "queue_full_policy",
+    "compression_level",
+    "fast_mode",
+    "max_retries",
+    "retry_base_ms",
+    "retry_max_backoff_ms",
+    "retry_after_max_ms",
+    "wal_enabled",
+    "wal_dir",
+    "wal_max_size_bytes",
+    "wal_retry_interval_ms",
+    "wal_dead_letter_replays",
+    "durability",
+    "shutdown_timeout_ms",
+    "enrichment",
+    "enrich_env_vars",
+    "min_level",
+    "sample_rate",
+    "sample_rate_by_level",
+    "filter_tags",
+    "filter_regex",
+    "wal_frame_newline",
+];
+
+fn warn_unknown_keys(raw: &str) {
+    let Ok(value) = toml::from_str::<toml::Value>(raw) else {
+        return; // parse error surfaces through the real deserializer
+    };
+    let Some(table) = value.as_table() else {
+        return;
+    };
+    for key in table.keys() {
+        if !KNOWN_CONFIG_KEYS.contains(&key.as_str()) {
+            let suggestion = KNOWN_CONFIG_KEYS
+                .iter()
+                .filter(|c| levenshtein_close(c, key))
+                .min_by_key(|c| edit_distance(c, key))
+                .map(|c| format!(" (did you mean '{c}'?)"))
+                .unwrap_or_default();
+            eprintln!("tpt-microlog: ignoring unknown config key '{key}'{suggestion}");
+        }
+    }
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+fn levenshtein_close(candidate: &str, key: &str) -> bool {
+    edit_distance(candidate, key) * 2 < candidate.len().max(key.len())
+}
+
 impl Config {
-    /// Load configuration from `tpt-log.toml` in the current directory if
-    /// present, then overlay `TPT_LOG_*` environment variables.
+    /// Load configuration following this order:
+    ///
+    /// 1. `$TPT_LOG_CONFIG` (explicit file path), else
+    ///    `./tpt-log.toml`, then `~/.config/tpt-microlog/tpt-log.toml`
+    ///    (`%APPDATA%\tpt-microlog` on Windows), then
+    ///    `/etc/tpt-microlog/tpt-log.toml`;
+    /// 2. `TPT_LOG_*` environment variable overrides.
+    ///
+    /// Parse failures and unknown keys warn on stderr and fall back to
+    /// defaults rather than being swallowed silently.
     pub fn load() -> Self {
-        let mut cfg = match std::fs::read_to_string("tpt-log.toml") {
-            Ok(raw) => Self::from_toml_str(&raw).unwrap_or_default(),
-            Err(_) => Self::default(),
+        let explicit = env_opt("TPT_LOG_CONFIG");
+        let path = explicit
+            .clone()
+            .map(PathBuf::from)
+            .or_else(|| config_search_paths().into_iter().find(|p| p.is_file()));
+        let mut cfg = match &path {
+            Some(path) => match std::fs::read_to_string(path) {
+                Ok(raw) => match Self::from_toml_str(&raw) {
+                    Ok(cfg) => cfg,
+                    Err(e) => {
+                        eprintln!(
+                            "tpt-microlog: ignoring invalid config file {}: {e}",
+                            path.display()
+                        );
+                        Self::default()
+                    }
+                },
+                Err(e) => {
+                    eprintln!(
+                        "tpt-microlog: cannot read config file {}: {e}",
+                        path.display()
+                    );
+                    Self::default()
+                }
+            },
+            None => Self::default(),
         };
         cfg.apply_env();
         cfg.normalize();
         cfg
     }
 
-    /// Parse from a raw TOML string.
+    /// Parse from a raw TOML string. Unknown keys warn on stderr; invalid
+    /// values are returned as an error.
     pub fn from_toml_str(raw: &str) -> Result<Self, toml::de::Error> {
+        warn_unknown_keys(raw);
         let mut cfg = toml::from_str::<Config>(raw)?;
         cfg.normalize();
         Ok(cfg)
@@ -224,7 +616,7 @@ impl Config {
             self.endpoint = Some(v);
         }
         if let Some(v) = env("TPT_LOG_API_KEY") {
-            self.api_key = Some(v);
+            self.api_key = Some(Secret::new(v));
         }
         if let Some(v) = env("TPT_LOG_SERVICE") {
             self.service = Some(v);
@@ -237,6 +629,12 @@ impl Config {
         }
         if let Some(v) = env("TPT_LOG_MEMORY_LIMIT_BYTES").and_then(|s| s.parse().ok()) {
             self.memory_limit_bytes = v;
+        }
+        if let Some(v) = env("TPT_LOG_QUEUE_CAPACITY").and_then(|s| s.parse().ok()) {
+            self.queue_capacity = v;
+        }
+        if let Some(v) = env("TPT_LOG_QUEUE_FULL_POLICY").and_then(|s| s.parse().ok()) {
+            self.queue_full_policy = v;
         }
         if let Some(v) = env("TPT_LOG_COMPRESSION_LEVEL").and_then(|s| s.parse().ok()) {
             self.compression_level = v;
@@ -259,8 +657,20 @@ impl Config {
         if let Some(v) = env("TPT_LOG_WAL_MAX_SIZE_BYTES").and_then(|s| s.parse().ok()) {
             self.wal_max_size_bytes = v;
         }
+        if let Some(v) = env("TPT_LOG_WAL_RETRY_INTERVAL_MS").and_then(|s| s.parse().ok()) {
+            self.wal_retry_interval_ms = v;
+        }
+        if let Some(v) = env("TPT_LOG_DURABILITY").and_then(|s| s.parse().ok()) {
+            self.durability = v;
+        }
+        if let Some(v) = env("TPT_LOG_SHUTDOWN_TIMEOUT_MS").and_then(|s| s.parse().ok()) {
+            self.shutdown_timeout_ms = v;
+        }
         if let Some(v) = env("TPT_LOG_ENRICHMENT") {
             self.enrichment = matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+        }
+        if let Some(v) = env("TPT_LOG_ENRICH_ENV_VARS") {
+            self.enrich_env_vars = split_comma_list(&v);
         }
         if let Some(v) = env("TPT_LOG_MIN_LEVEL") {
             self.min_level = Some(v);
@@ -269,12 +679,7 @@ impl Config {
             self.sample_rate = v;
         }
         if let Some(v) = env("TPT_LOG_FILTER_TAGS") {
-            self.filter_tags = v
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect();
+            self.filter_tags = split_comma_list(&v);
         }
         if let Some(v) = env("TPT_LOG_FILTER_REGEX") {
             self.filter_regex = Some(v);
@@ -282,16 +687,100 @@ impl Config {
         if let Some(v) = env("TPT_LOG_FAST_MODE") {
             self.fast_mode = matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
         }
+        if let Some(v) = env("TPT_LOG_FILE_PATH") {
+            self.file_path = Some(v);
+        }
+        if let Some(v) = env("TPT_LOG_NET_ENDPOINT") {
+            self.net_endpoint = Some(v);
+        }
+        if let Some(v) = env("TPT_LOG_GRPC_ENDPOINT") {
+            self.grpc_endpoint = Some(v);
+        }
+        if let Some(v) = env("TPT_LOG_EXTRA_HEADERS") {
+            self.extra_headers = split_comma_list(&v);
+        }
+        if let Some(v) = env("TPT_LOG_PROMETHEUS_BIND") {
+            self.prometheus_bind = v;
+        }
+        if let Some(v) = env("TPT_LOG_AWS_REGION") {
+            self.aws_region = Some(v);
+        }
+        if let Some(v) = env("TPT_LOG_AWS_ACCESS_KEY") {
+            self.aws_access_key = Some(v);
+        }
+        if let Some(v) = env("TPT_LOG_AWS_SECRET_KEY") {
+            self.aws_secret_key = Some(Secret::new(v));
+        }
+        if let Some(v) = env("TPT_LOG_AWS_LOG_GROUP") {
+            self.aws_log_group = Some(v);
+        }
+        if let Some(v) = env("TPT_LOG_AWS_LOG_STREAM") {
+            self.aws_log_stream = Some(v);
+        }
+        if let Some(v) = env("TPT_LOG_AWS_SESSION_TOKEN") {
+            self.aws_session_token = Some(Secret::new(v));
+        }
+        if let Some(v) = env("TPT_LOG_AWS_AUTO_CREATE_STREAM") {
+            self.aws_auto_create_stream =
+                matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+        }
+        if let Some(v) = env("TPT_LOG_DATADOG_SITE") {
+            self.datadog_site = Some(v);
+        }
+        if let Some(v) = env("TPT_LOG_DATADOG_METRICS") {
+            self.datadog_metrics = matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+        }
+        if let Some(v) = env("TPT_LOG_ES_INDEX") {
+            self.es_index = Some(v);
+        }
+        if let Some(v) = env("TPT_LOG_ES_BASIC_AUTH") {
+            self.es_basic_auth = Some(Secret::new(v));
+        }
+        if let Some(v) = env("TPT_LOG_BODY_MODE").and_then(|s| s.parse().ok()) {
+            self.body_mode = v;
+        }
+        if let Some(v) = env("TPT_LOG_TCP_ACK") {
+            self.tcp_ack = matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+        }
     }
 
-    /// A `(hostname, pid)` pair used by the enrichment layer.
-    pub fn host_and_process(&self) -> (String, String) {
-        let host = self
-            .service
+    /// AWS credential chain: explicit config first, then the standard
+    /// `AWS_*` environment variables (IAM roles via metadata endpoints are
+    /// not supported by this crate).
+    pub fn resolved_aws_credentials(&self) -> Option<(String, String, Option<String>)> {
+        let access = self
+            .aws_access_key
             .clone()
+            .or_else(|| env_opt("AWS_ACCESS_KEY_ID"))?;
+        let secret = self
+            .aws_secret_key
+            .as_ref()
+            .map(|s| s.expose().to_string())
+            .or_else(|| env_opt("AWS_SECRET_ACCESS_KEY"))?;
+        let token = self
+            .aws_session_token
+            .as_ref()
+            .map(|s| s.expose().to_string())
+            .or_else(|| env_opt("AWS_SESSION_TOKEN"));
+        Some((access, secret, token))
+    }
+
+    /// A `(hostname, pid)` pair used by the enrichment layer. The host is the
+    /// real machine hostname (or `TPT_LOG_HOST`); it is *not* the service name.
+    pub fn host_and_process(&self) -> (String, String) {
+        let host = env_opt("TPT_LOG_HOST")
+            .or_else(|| hostname::get().ok().and_then(|h| h.into_string().ok()))
             .unwrap_or_else(|| "unknown".to_string());
         let pid = std::process::id().to_string();
         (host, pid)
+    }
+
+    /// Values of the configured [`Config::enrich_env_vars`], present ones only.
+    pub fn enrichment_env_vars(&self) -> Vec<(String, String)> {
+        self.enrich_env_vars
+            .iter()
+            .filter_map(|name| std::env::var(name).ok().map(|v| (name.clone(), v)))
+            .collect()
     }
 
     fn normalize(&mut self) {
@@ -300,15 +789,15 @@ impl Config {
                 self.min_level = None;
             }
         }
-        if self.wal_dir.contains('~') {
-            self.wal_dir = self.wal_dir.replace('~', &home_dir());
-        }
+        self.wal_dir = expand_tilde(&self.wal_dir);
         self.sample_rate = self.sample_rate.clamp(0.0, 1.0);
+        self.sample_rate_by_level
+            .retain(|k, _| k.parse::<LogLevel>().is_ok());
     }
 
-    /// Resolved WAL directory with any `~` expanded.
+    /// Resolved WAL directory with a leading `~` expanded.
     pub fn resolved_wal_dir(&self) -> PathBuf {
-        PathBuf::from(self.wal_dir.replace('~', &home_dir()))
+        PathBuf::from(expand_tilde(&self.wal_dir))
     }
 
     /// Map a `backend` string to an HTTP base URL when not explicitly supplied.
@@ -335,18 +824,40 @@ impl Config {
     }
 }
 
+fn split_comma_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Expand only a *leading* `~` to the home directory. Interior `~` characters
+/// are left alone so Windows 8.3 short paths (e.g. `PHILL~1`) survive.
+fn expand_tilde(path: &str) -> String {
+    let home = || {
+        home_dir_var()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| std::env::temp_dir().to_string_lossy().to_string())
+    };
+    if path == "~" {
+        return home();
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        return format!("{}/{}", home(), rest);
+    }
+    if let Some(rest) = path.strip_prefix("~\\") {
+        return format!("{}\\{}", home(), rest);
+    }
+    path.to_string()
+}
+
 /// Best-effort home directory lookup (no external dependency).
 fn home_dir_var() -> Option<PathBuf> {
     std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-}
-
-fn home_dir() -> String {
-    home_dir_var()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| std::env::temp_dir().to_string_lossy().to_string())
 }
 
 #[cfg(test)]
@@ -361,6 +872,9 @@ mod tests {
         assert_eq!(c.compression_level, 3);
         assert_eq!(c.max_retries, 10);
         assert!(c.wal_dir.contains("tpt-microlog"));
+        assert_eq!(c.queue_full_policy, QueueFullPolicy::Block);
+        assert_eq!(c.durability, Durability::BestEffort);
+        assert!(c.shutdown_timeout_ms > 0);
     }
 
     #[test]
@@ -374,18 +888,41 @@ flush_interval_ms = 250
 compression_level = 5
 max_retries = 3
 wal_enabled = false
+queue_full_policy = "drop_newest"
+durability = "wal-first"
 "#;
         let c = Config::from_toml_str(toml).unwrap();
         assert_eq!(c.backend, "custom");
         assert_eq!(c.endpoint.as_deref(), Some("https://example.com/logs"));
-        assert_eq!(c.api_key.as_deref(), Some("secret"));
+        assert_eq!(c.api_key.as_ref().map(|s| s.expose()), Some("secret"));
         assert_eq!(c.batch_size, 500);
         assert_eq!(c.flush_interval_ms, 250);
         assert_eq!(c.compression_level, 5);
         assert_eq!(c.max_retries, 3);
         assert!(!c.wal_enabled);
+        assert_eq!(c.queue_full_policy, QueueFullPolicy::DropNewest);
+        assert_eq!(c.durability, Durability::WalFirst);
         // defaults preserved for other fields
         assert_eq!(c.wal_retry_interval_ms, 5_000);
+    }
+
+    #[test]
+    fn rejects_invalid_enum_values() {
+        let toml = r#"queue_full_policy = "explode""#;
+        assert!(Config::from_toml_str(toml).is_err());
+        let toml = r#"durability = "maybe""#;
+        assert!(Config::from_toml_str(toml).is_err());
+    }
+
+    #[test]
+    fn secrets_redacted_in_debug_and_serde() {
+        let toml = r#"api_key = "super-secret""#;
+        let c = Config::from_toml_str(toml).unwrap();
+        let debug = format!("{c:?}");
+        assert!(!debug.contains("super-secret"), "leaked via Debug: {debug}");
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(!json.contains("super-secret"), "leaked via serde: {json}");
+        assert!(c.api_key.as_ref().unwrap().expose() == "super-secret");
     }
 
     #[test]
@@ -393,6 +930,48 @@ wal_enabled = false
         let toml = r#"min_level = "garbage""#;
         let c = Config::from_toml_str(toml).unwrap();
         assert!(c.min_level.is_none());
+    }
+
+    #[test]
+    fn sample_rate_by_level_normalizes() {
+        let toml = r#"
+[sample_rate_by_level]
+DEBUG = 0.1
+garbage = 0.5
+"#;
+        let c = Config::from_toml_str(toml).unwrap();
+        assert!(c.sample_rate_by_level.contains_key("DEBUG"));
+        assert!(!c.sample_rate_by_level.contains_key("garbage"));
+    }
+
+    #[test]
+    fn tilde_only_expanded_at_start() {
+        let mut c = Config {
+            wal_dir: "~/logs/wal".to_string(),
+            ..Config::default()
+        };
+        c.normalize();
+        assert!(!c.wal_dir.starts_with('~'));
+        assert!(c.wal_dir.contains("/logs/wal") || c.wal_dir.contains("\\logs\\wal"));
+
+        // Windows 8.3 short names must not be mangled.
+        let mut c = Config {
+            wal_dir: r"C:\Users\PHILL~1\AppData\wal".to_string(),
+            ..Config::default()
+        };
+        c.normalize();
+        assert_eq!(c.wal_dir, r"C:\Users\PHILL~1\AppData\wal");
+    }
+
+    #[test]
+    fn host_and_process_is_real_hostname() {
+        let c = Config {
+            service: Some("my-service".into()),
+            ..Config::default()
+        };
+        let (host, pid) = c.host_and_process();
+        assert_ne!(host, "my-service", "host must not be the service name");
+        assert_eq!(pid, std::process::id().to_string());
     }
 
     #[test]
@@ -405,5 +984,51 @@ wal_enabled = false
         assert_eq!(c.batch_size, 7);
         std::env::remove_var("TPT_LOG_BACKEND");
         std::env::remove_var("TPT_LOG_BATCH_SIZE");
+    }
+
+    #[test]
+    fn env_expanded_coverage() {
+        std::env::set_var("TPT_LOG_FILE_PATH", "/tmp/x.jsonl");
+        std::env::set_var("TPT_LOG_NET_ENDPOINT", "127.0.0.1:9999");
+        std::env::set_var("TPT_LOG_GRPC_ENDPOINT", "localhost:4317");
+        std::env::set_var("TPT_LOG_EXTRA_HEADERS", "a=1,b=2");
+        std::env::set_var("TPT_LOG_PROMETHEUS_BIND", "0.0.0.0:9100");
+        std::env::set_var("TPT_LOG_QUEUE_CAPACITY", "42");
+        std::env::set_var("TPT_LOG_WAL_RETRY_INTERVAL_MS", "250");
+        std::env::set_var("TPT_LOG_AWS_REGION", "us-east-1");
+        std::env::set_var("TPT_LOG_AWS_SECRET_KEY", "wJalrXUtnFEMI");
+        std::env::set_var("TPT_LOG_QUEUE_FULL_POLICY", "drop_oldest");
+        std::env::set_var("TPT_LOG_DURABILITY", "wal-first");
+        let mut c = Config::default();
+        c.apply_env();
+        assert_eq!(c.file_path.as_deref(), Some("/tmp/x.jsonl"));
+        assert_eq!(c.net_endpoint.as_deref(), Some("127.0.0.1:9999"));
+        assert_eq!(c.grpc_endpoint.as_deref(), Some("localhost:4317"));
+        assert_eq!(c.extra_headers, vec!["a=1".to_string(), "b=2".to_string()]);
+        assert_eq!(c.prometheus_bind, "0.0.0.0:9100");
+        assert_eq!(c.queue_capacity, 42);
+        assert_eq!(c.wal_retry_interval_ms, 250);
+        assert_eq!(c.aws_region.as_deref(), Some("us-east-1"));
+        assert_eq!(
+            c.aws_secret_key.as_ref().map(|s| s.expose()),
+            Some("wJalrXUtnFEMI")
+        );
+        assert_eq!(c.queue_full_policy, QueueFullPolicy::DropOldest);
+        assert_eq!(c.durability, Durability::WalFirst);
+        for key in [
+            "TPT_LOG_FILE_PATH",
+            "TPT_LOG_NET_ENDPOINT",
+            "TPT_LOG_GRPC_ENDPOINT",
+            "TPT_LOG_EXTRA_HEADERS",
+            "TPT_LOG_PROMETHEUS_BIND",
+            "TPT_LOG_QUEUE_CAPACITY",
+            "TPT_LOG_WAL_RETRY_INTERVAL_MS",
+            "TPT_LOG_AWS_REGION",
+            "TPT_LOG_AWS_SECRET_KEY",
+            "TPT_LOG_QUEUE_FULL_POLICY",
+            "TPT_LOG_DURABILITY",
+        ] {
+            std::env::remove_var(key);
+        }
     }
 }

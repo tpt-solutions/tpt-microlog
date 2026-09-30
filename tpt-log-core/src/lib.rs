@@ -18,12 +18,14 @@ pub mod transport;
 pub mod wal;
 
 pub use batch::{Batch, CompressedBatch, Compressor};
-pub use config::Config;
+pub use config::{Config, Durability, QueueFullPolicy, Secret};
 pub use entry::LogEntry;
 pub use level::LogLevel;
 pub use log_type::LogType;
 pub use microlog::MicroLog;
+pub use queue::PushOutcome;
 pub use transport::{NullTransport, Transport, TransportError};
+pub use wal::Wal;
 
 /// Default end-of-file batching constants (spec §5.2).
 pub mod defaults {
@@ -47,4 +49,10 @@ pub mod defaults {
     pub const WAL_MAX_SIZE_BYTES: u64 = 100 * 1024 * 1024;
     /// How often the WAL retry thread re-attempts delivery.
     pub const WAL_RETRY_INTERVAL_MS: u64 = 5_000;
+    /// Failed replay passes before a WAL file moves to `wal/dead/`.
+    pub const WAL_DEAD_LETTER_REPLAYS: u32 = 8;
+    /// Hard budget for `shutdown()` before remaining batches spill to WAL.
+    pub const SHUTDOWN_TIMEOUT_MS: u64 = 5_000;
+    /// Upper bound honored from a backend's `Retry-After` header.
+    pub const RETRY_AFTER_MAX_MS: u64 = 120_000;
 }

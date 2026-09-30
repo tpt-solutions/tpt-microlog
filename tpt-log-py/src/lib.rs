@@ -14,7 +14,7 @@ mod native {
     use pyo3::prelude::*;
     use pyo3::types::{PyAny, PyDict, PyList};
 
-    use tpt_log_core::{Config, LogLevel, MicroLog as CoreLog};
+    use tpt_log_core::{Config, LogLevel, MicroLog as CoreLog, Secret};
     use tpt_log_transport::build_transport;
 
     /// Convert one Python object into the equivalent JSON value so structured
@@ -31,6 +31,15 @@ mod native {
             return Ok(serde_json::Value::from(i));
         }
         if let Ok(f) = v.extract::<f64>() {
+            // JSON has no NaN/Inf; keep the information as strings instead of
+            // raising, so a NaN metric never breaks a log call.
+            if f.is_nan() {
+                return Ok(serde_json::Value::String("NaN".to_string()));
+            }
+            if f.is_infinite() {
+                let text = if f > 0.0 { "Infinity" } else { "-Infinity" };
+                return Ok(serde_json::Value::String(text.to_string()));
+            }
             let n = serde_json::Number::from_f64(f)
                 .ok_or_else(|| PyValueError::new_err("float is not valid JSON"))?;
             return Ok(serde_json::Value::Number(n));
@@ -76,7 +85,7 @@ mod native {
         match key {
             "backend" => config.backend = value.extract()?,
             "endpoint" => config.endpoint = value.extract()?,
-            "api_key" => config.api_key = value.extract()?,
+            "api_key" => config.api_key = value.extract::<Option<String>>()?.map(Secret::new),
             "service" => config.service = value.extract()?,
             "batch_size" => config.batch_size = value.extract()?,
             "flush_interval" => {
@@ -115,7 +124,9 @@ mod native {
             "prometheus_bind" => config.prometheus_bind = value.extract()?,
             "aws_region" => config.aws_region = value.extract()?,
             "aws_access_key" => config.aws_access_key = value.extract()?,
-            "aws_secret_key" => config.aws_secret_key = value.extract()?,
+            "aws_secret_key" => {
+                config.aws_secret_key = value.extract::<Option<String>>()?.map(Secret::new)
+            }
             "aws_log_group" => config.aws_log_group = value.extract()?,
             "aws_log_stream" => config.aws_log_stream = value.extract()?,
             other => {
@@ -136,7 +147,7 @@ mod native {
     /// log.metric("cpu_usage", 42.5, tags={"host": "server-01"})
     /// log.shutdown()
     /// ```
-    #[pyclass]
+    #[pyclass(subclass)]
     struct MicroLog {
         inner: CoreLog,
     }
@@ -147,7 +158,7 @@ mod native {
         /// (auto-detection), then applies the given keyword overrides.
         #[new]
         #[pyo3(signature = (**kwargs))]
-        fn new(kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
+        fn new(py: Python<'_>, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
             let mut config = Config::load();
             if let Some(kwargs) = kwargs {
                 for (k, v) in kwargs.iter() {
@@ -155,11 +166,14 @@ mod native {
                     apply_kwarg(&mut config, &key, &v)?;
                 }
             }
-            let transport =
-                build_transport(&config).map_err(|e| PyValueError::new_err(e.to_string()))?;
-            Ok(MicroLog {
-                inner: CoreLog::new(config, Arc::from(transport)),
-            })
+            // Building the transport may bind sockets (Prometheus) or read
+            // the filesystem: release the GIL while it runs.
+            let built = py.detach(|| {
+                build_transport(&config)
+                    .map(|t| CoreLog::new(config, Arc::from(t)))
+                    .map_err(|e| PyValueError::new_err(e.to_string()))
+            });
+            Ok(MicroLog { inner: built? })
         }
 
         #[pyo3(signature = (message, **kwargs))]
@@ -234,10 +248,65 @@ mod native {
             &self.inner.config().backend
         }
 
+        /// Push buffered entries into the delivery pipeline now. Blocks (with
+        /// the GIL released) up to the configured shutdown timeout; returns
+        /// `True` when the queue and delivery channel drained.
+        fn flush(&self, py: Python<'_>) -> bool {
+            py.detach(|| self.inner.flush())
+        }
+
+        /// Delivery counters as a dict, e.g.
+        /// `{"delivered_batches": 3, "dropped_entries": 0, ...}`.
+        fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+            use std::sync::atomic::Ordering::Relaxed;
+            let s = self.inner.stats();
+            let dict = PyDict::new(py);
+            dict.set_item("delivered_batches", s.delivered_batches.load(Relaxed))?;
+            dict.set_item("delivered_entries", s.delivered_entries.load(Relaxed))?;
+            dict.set_item("wal_writes", s.wal_writes.load(Relaxed))?;
+            dict.set_item("retried_entries", s.retried_entries.load(Relaxed))?;
+            dict.set_item("dropped_batches", s.dropped_batches.load(Relaxed))?;
+            dict.set_item("dropped_entries", s.dropped_entries.load(Relaxed))?;
+            dict.set_item("queued", self.inner.queued())?;
+            dict.set_item("inflight", self.inner.inflight())?;
+            Ok(dict)
+        }
+
+        /// Context manager entry: `with MicroLog(...) as log: ...`.
+        fn __enter__(slf: Py<Self>) -> Py<Self> {
+            slf
+        }
+
+        /// Context manager exit: shuts the engine down (idempotent).
+        fn __exit__(
+            &self,
+            py: Python<'_>,
+            _exc_type: Py<PyAny>,
+            _exc_value: Py<PyAny>,
+            _traceback: Py<PyAny>,
+        ) -> PyResult<bool> {
+            self.shutdown_internal(py);
+            Ok(false) // do not suppress exceptions
+        }
+
+        /// Called (from Python) after a fork in the child process: the worker
+        /// threads do not exist there, so the logger detaches instead of
+        /// deadlocking. All further calls become cheap no-ops.
+        fn _detach_after_fork(&self) {
+            self.inner.detach_after_fork();
+        }
+
         /// Graceful shutdown: flush pending batches and drain the WAL
         /// (spec §6.1). Idempotent; also runs when the object is collected.
-        fn shutdown(&self) {
-            self.inner.shutdown();
+        /// The GIL is released while the engine drains.
+        fn shutdown(&self, py: Python<'_>) {
+            self.shutdown_internal(py);
+        }
+    }
+
+    impl MicroLog {
+        fn shutdown_internal(&self, py: Python<'_>) {
+            py.detach(|| self.inner.shutdown());
         }
     }
 

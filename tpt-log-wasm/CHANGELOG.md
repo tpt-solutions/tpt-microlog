@@ -9,11 +9,18 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Planned
+### Changed — Phase 9 reliability hardening
 
-- `wasm-opt -Oz` pass in CI to shrink the binary further.
-- Optional Content-Encoding negotiation for endpoints that accept gzip.
-- Source maps and a browser debug build target.
+- Delivery outcomes are classified like the native core: network errors, 5xx,
+  and 408/425/429 retry; other 4xx drop the batch immediately instead of
+  blocking every batch behind it (head-of-line fix).
+- Retries are capped (`maxRetries` option, default 10) — batches that keep
+  failing transiently are dropped and counted instead of retrying forever.
+
+### Added
+
+- `stats()` — `{ deliveredEntries, droppedEntries, queued, maxBuffer }`.
+- Delivery/drop counters maintained by the flush loop.
 
 ## [0.1.0] - 2026-09-29
 

@@ -1,15 +1,17 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
+use parking_lot::Mutex;
 use serde_json::{Map, Value};
 
 use crate::batch::{Batch, CompressedBatch};
-use crate::config::Config;
+use crate::config::{Config, Durability};
 use crate::entry::LogEntry;
 use crate::filter::EntryProcessor;
-use crate::queue::LogQueue;
-use crate::retry::{policy_from_config, RetryOutcome, RetryPolicy};
+use crate::queue::{LogQueue, PushOutcome};
+use crate::retry::{policy_from_config, retry_after_hint, RetryOutcome, RetryPolicy};
 use crate::transport::{NullTransport, SpyTransport, Transport, TransportError};
 use crate::wal::Wal;
 use crate::{Compressor, LogLevel, LogType};
@@ -22,16 +24,25 @@ pub struct Stats {
     pub wal_writes: AtomicU64,
     pub retried_entries: AtomicU64,
     pub dropped_batches: AtomicU64,
+    /// Entries rejected by the queue overflow policy (`drop_newest` /
+    /// `drop_oldest`) or lost when the WAL was unavailable at shutdown.
+    pub dropped_entries: AtomicU64,
 }
 
 /// Backpressure/dispatch channel capacity between the batcher and the single
 /// delivery worker.
 const DISPATCH_CAPACITY: usize = 512;
 
+/// How many times a worker thread may panic before it is left dead.
+const MAX_WORKER_RESTARTS: u32 = 5;
+
 struct DeliveryEngine {
     transport: Arc<dyn Transport>,
     retry: RetryPolicy,
     wal: Option<Arc<Wal>>,
+    durability: Durability,
+    dead_letter_replays: u32,
+    retry_after_max_ms: u64,
     stats: Arc<Stats>,
     rx: Receiver<CompressedBatch>,
     stop_requested: Arc<AtomicBool>,
@@ -39,38 +50,76 @@ struct DeliveryEngine {
 }
 
 impl DeliveryEngine {
-    /// Deliver a batch, honoring the stop flag so backoff is aborted quickly
-    /// once `shutdown()` is called (`shutdown()` never blocks for a full
-    /// backoff sequence).
+    /// Number of batches waiting in the dispatch channel.
+    fn inflight(&self) -> usize {
+        self.rx.len()
+    }
+
+    /// Deliver a batch with backoff + jitter, honoring the stop flag so
+    /// `shutdown()` never blocks for a full backoff sequence, and honoring
+    /// `Retry-After` hints (capped by `retry_after_max_ms`).
     fn deliver_one(&self, batch: &CompressedBatch, policy: &RetryPolicy) -> RetryOutcome {
-        let mut attempt: u32 = 0;
+        let mut failures: u32 = 0;
+        let attempts_allowed = policy.max_attempts.max(1);
         loop {
-            if self.stop_requested.load(Ordering::Relaxed) && attempt > 0 {
-                return RetryOutcome::Exhausted { attempts: attempt };
-            }
             match self.transport.send(batch) {
                 Ok(()) => {
                     return RetryOutcome::Delivered {
-                        attempts: attempt + 1,
+                        attempts: failures + 1,
                     }
                 }
                 Err(TransportError::Permanent(_)) | Err(TransportError::Config(_)) => {
                     return RetryOutcome::Permanent;
                 }
-                Err(_) => {
-                    if attempt + 1 >= policy.max_attempts.max(1) {
-                        return RetryOutcome::Exhausted {
-                            attempts: attempt + 1,
-                        };
+                Err(err) => {
+                    failures += 1;
+                    if failures >= attempts_allowed {
+                        return RetryOutcome::Exhausted { attempts: failures };
                     }
-                    sleep_interruptible(&self.stop_requested, policy.backoff_ms(attempt));
-                    attempt += 1;
+                    if self.stop_requested.load(Ordering::Relaxed) {
+                        return RetryOutcome::Exhausted { attempts: failures };
+                    }
+                    // First retry waits the base delay (no off-by-one); a
+                    // server-provided Retry-After takes precedence, capped.
+                    let mut delay = policy.delay_ms(failures - 1);
+                    if let Some(after) = retry_after_hint(&err) {
+                        delay = delay.max(after.min(self.retry_after_max_ms.max(1)));
+                    }
+                    sleep_interruptible(&self.stop_requested, delay);
                 }
             }
         }
     }
 
     fn dispatch(&self, batch: &CompressedBatch) {
+        if self.durability == Durability::WalFirst {
+            if let Some(wal) = &self.wal {
+                match wal.write(batch) {
+                    Ok(path) => {
+                        self.stats.wal_writes.fetch_add(1, Ordering::Relaxed);
+                        match self.deliver_one(batch, &self.retry) {
+                            RetryOutcome::Delivered { attempts: _ } => {
+                                self.stats.delivered_batches.fetch_add(1, Ordering::Relaxed);
+                                self.stats
+                                    .delivered_entries
+                                    .fetch_add(batch.payload.entry_count as u64, Ordering::Relaxed);
+                                let _ = wal.remove(&path);
+                            }
+                            outcome => {
+                                // The pre-write stays; the WAL retry pass will
+                                // pick it up without another write.
+                                self.debug_unexpected(outcome);
+                            }
+                        }
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("tpt-microlog: wal-first pre-write failed: {e}");
+                        // fall through to best-effort delivery below
+                    }
+                }
+            }
+        }
         match self.deliver_one(batch, &self.retry) {
             RetryOutcome::Delivered { .. } => {
                 self.stats.delivered_batches.fetch_add(1, Ordering::Relaxed);
@@ -93,12 +142,30 @@ impl DeliveryEngine {
         }
     }
 
-    /// Replay pending WAL batches. Files are only removed on success; failures
-    /// remain on disk for a later pass (spec §4.2 steps 6–8).
+    fn debug_unexpected(&self, _outcome: RetryOutcome) {
+        // Kept as a hook point; delivery failures are expected here and the
+        // batch is already durable in the WAL.
+    }
+
+    /// Replay pending WAL batches, oldest first, one file in memory at a time.
+    /// The pass stops at the first failure (circuit breaker) so a dead backend
+    /// never blocks live delivery for the whole directory; failed files gain
+    /// an attempt counter and move to `wal/dead/` after
+    /// `dead_letter_replays` failures (spec §4.2 steps 6–8).
     fn replay_pending_wal(&self, policy: &RetryPolicy) {
         let Some(wal) = &self.wal else { return };
-        let Ok(pending) = wal.pending() else { return };
-        for (path, frame) in pending {
+        let Ok(paths) = wal.pending_paths() else {
+            return;
+        };
+        for path in paths {
+            let frame = match wal.read_frame(&path) {
+                Ok(frame) => frame,
+                Err(_) => {
+                    // Unreadable/corrupt: remove so it cannot block forever.
+                    let _ = wal.remove(&path);
+                    continue;
+                }
+            };
             if frame.bytes.is_empty() {
                 let _ = wal.remove(&path);
                 continue;
@@ -106,12 +173,23 @@ impl DeliveryEngine {
             let batch = frame.to_compressed_batch();
             match self.deliver_one(&batch, policy) {
                 RetryOutcome::Delivered { .. } => {
+                    let entries = if frame.entry_count > 0 {
+                        frame.entry_count as u64
+                    } else {
+                        batch
+                            .decompress_entries()
+                            .map(|e| e.len() as u64)
+                            .unwrap_or(0)
+                    };
                     self.stats
                         .retried_entries
-                        .fetch_add(batch.payload.entry_count as u64, Ordering::Relaxed);
+                        .fetch_add(entries, Ordering::Relaxed);
                     let _ = wal.remove(&path);
                 }
-                _ => { /* leave on disk for next pass */ }
+                _ => {
+                    let _ = wal.mark_failed(&path, self.dead_letter_replays);
+                    return; // circuit breaker: retry on the next tick
+                }
             }
         }
     }
@@ -123,13 +201,35 @@ impl DeliveryEngine {
             max_attempts: 3,
             base_ms: self.retry.base_ms,
             max_backoff_ms: self.retry.max_backoff_ms,
+            jitter: self.retry.jitter,
+        }
+    }
+
+    /// Spill batches still sitting in the dispatch channel to the WAL (or
+    /// count them dropped) — used when `shutdown()` runs out of budget.
+    fn spill_dispatch_to_wal(&self) {
+        while let Ok(batch) = self.rx.try_recv() {
+            let stored = self
+                .wal
+                .as_ref()
+                .map(|w| w.write(&batch).is_ok())
+                .unwrap_or(false);
+            if stored {
+                self.stats.wal_writes.fetch_add(1, Ordering::Relaxed);
+            } else {
+                let entries = batch.payload.entry_count as u64;
+                self.stats.dropped_batches.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .dropped_entries
+                    .fetch_add(entries, Ordering::Relaxed);
+            }
         }
     }
 
     fn run(&self) {
-        let tick = std::time::Duration::from_millis(self.tick_ms);
-        let poll = std::time::Duration::from_millis(50);
-        let mut last_replay = std::time::Instant::now();
+        let tick = Duration::from_millis(self.tick_ms);
+        let poll = Duration::from_millis(50);
+        let mut last_replay = Instant::now();
         loop {
             if self.stop_requested.load(Ordering::Relaxed) && self.rx.is_empty() {
                 // Drains the WAL once (single attempt) before exiting.
@@ -144,7 +244,7 @@ impl DeliveryEngine {
                         self.replay_pending_wal(&self.replay_policy());
                         // Re-arm the replay timer after the pass completes (the
                         // pass itself may block on backoff).
-                        last_replay = std::time::Instant::now();
+                        last_replay = Instant::now();
                     }
                 }
                 Err(RecvTimeoutError::Disconnected) => {
@@ -162,44 +262,88 @@ fn single_attempt_policy() -> RetryPolicy {
         max_attempts: 1,
         base_ms: 1,
         max_backoff_ms: 1,
+        jitter: false,
     }
 }
 
 /// Sleep in 50ms slices so a shutdown request can interrupt backoff.
 fn sleep_interruptible(stop: &AtomicBool, ms: u64) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
-    while std::time::Instant::now() < deadline {
+    let deadline = Instant::now() + Duration::from_millis(ms);
+    while Instant::now() < deadline {
         if stop.load(Ordering::Relaxed) {
             return;
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
-/// Coordinates worker-thread lifecycle so `shutdown()` can join them in the
-/// right order: the batcher must finish flushing before the delivery worker
-/// is told to stop, otherwise the final batch could be abandoned mid-drain.
-#[derive(Default)]
-struct Sentinel {
-    batcher: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
-    delivery: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+/// One supervised worker thread: its join handle plus an exit notification
+/// channel, so shutdown can wait with a timeout instead of blocking forever
+/// (a forked child, for example, has neither thread alive).
+struct Worker {
+    handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+    exit_rx: Mutex<Option<Receiver<()>>>,
 }
 
-impl Sentinel {
-    fn track_batcher(&self, handle: std::thread::JoinHandle<()>) {
-        *self.batcher.lock().unwrap() = Some(handle);
+impl Worker {
+    fn spawn(name: &str, body: impl FnOnce() + Send + 'static) -> std::io::Result<Worker> {
+        let (exit_tx, exit_rx) = crossbeam_channel::bounded::<()>(1);
+        let handle = std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || {
+                body();
+                let _ = exit_tx.send(());
+            })?;
+        Ok(Worker {
+            handle: Mutex::new(Some(handle)),
+            exit_rx: Mutex::new(Some(exit_rx)),
+        })
     }
-    fn track_delivery(&self, handle: std::thread::JoinHandle<()>) {
-        *self.delivery.lock().unwrap() = Some(handle);
-    }
-    fn join_batcher(&self) {
-        if let Some(h) = self.batcher.lock().unwrap().take() {
-            let _ = h.join();
+
+    /// Wait up to `budget` for the worker to exit. Returns `false` on timeout
+    /// (the worker keeps running as a daemon; nobody is blocked on it).
+    fn join_within(&self, budget: Duration) -> bool {
+        let Some(exit_rx) = self.exit_rx.lock().take() else {
+            return true; // already waited on (and thus exited)
+        };
+        let exited = match exit_rx.recv_timeout(budget) {
+            Ok(()) => true,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => false,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => true,
+        };
+        if exited {
+            if let Some(handle) = self.handle.lock().take() {
+                let _ = handle.join();
+            }
         }
+        exited
     }
-    fn join_delivery(&self) {
-        if let Some(h) = self.delivery.lock().unwrap().take() {
-            let _ = h.join();
+}
+
+/// Run `body`, restarting it if it panics (bounded), so a bug in one batch
+/// cannot silently kill telemetry for the rest of the process lifetime.
+fn supervised(name: &'static str, body: impl Fn() + Send + Sync + 'static) {
+    let body = Arc::new(body);
+    for restart in 0..=MAX_WORKER_RESTARTS {
+        let body = body.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || body()));
+        match result {
+            Ok(()) => return,
+            Err(payload) => {
+                if restart == MAX_WORKER_RESTARTS {
+                    eprintln!(
+                        "tpt-microlog: {name} worker exceeded panic restart budget; giving up"
+                    );
+                    return;
+                }
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_string());
+                eprintln!("tpt-microlog: {name} worker panicked ({msg}); restarting");
+                std::thread::sleep(Duration::from_millis(100));
+            }
         }
     }
 }
@@ -227,9 +371,18 @@ struct MicroLogInner {
     /// Stop signal for the batcher thread (rendezvous channel).
     batcher_stop_tx: Sender<()>,
     batcher_stop_rx: Receiver<()>,
+    /// Nudges the batcher to flush immediately (used by `flush()`).
+    flush_tx: Sender<()>,
+    flush_rx: Receiver<()>,
+    /// One-shot ack channels for in-flight `flush()` callers.
+    flush_waiters: Mutex<Vec<Sender<()>>>,
     engine: Arc<DeliveryEngine>,
-    sentinel: Sentinel,
+    batcher: Worker,
+    delivery: Worker,
     stop_requested: Arc<AtomicBool>,
+    /// Set after a fork in the child process: worker threads do not exist
+    /// there, so calls become no-ops instead of hanging.
+    detached: AtomicBool,
     shutdown_done: AtomicBool,
     stats: Arc<Stats>,
 }
@@ -240,15 +393,29 @@ impl MicroLog {
         let (delivery_tx, delivery_rx) = crossbeam_channel::bounded(DISPATCH_CAPACITY);
 
         let queue_capacity = config.queue_capacity;
+        let queue_policy = config.queue_full_policy;
         let wal_enabled = config.wal_enabled;
         let wal_retry_interval = config.wal_retry_interval_ms;
+        let durability = config.durability;
+        let dead_letter_replays = config.wal_dead_letter_replays;
+        let retry_after_max_ms = config.retry_after_max_ms;
         let config_for_compressor = config.clone();
         let config_for_processor = config.clone();
 
         let wal = if wal_enabled {
-            Wal::open(config.resolved_wal_dir(), config.wal_max_size_bytes)
-                .ok()
-                .map(Arc::new)
+            let ns = crate::wal::namespace(
+                config.service.as_deref(),
+                &config.backend,
+                config.endpoint.as_deref(),
+            );
+            let dir = config.resolved_wal_dir().join(ns);
+            match Wal::open(dir, config.wal_max_size_bytes) {
+                Ok(w) => Some(Arc::new(w)),
+                Err(e) => {
+                    eprintln!("tpt-microlog: WAL disabled: {e}");
+                    None
+                }
+            }
         } else {
             None
         };
@@ -259,12 +426,22 @@ impl MicroLog {
         let engine = Arc::new(DeliveryEngine {
             transport,
             retry: policy_from_config(&config),
-            wal,
+            wal: wal.clone(),
+            durability,
+            dead_letter_replays,
+            retry_after_max_ms,
             stats: stats.clone(),
             rx: delivery_rx,
             stop_requested: stop_requested.clone(),
             tick_ms: wal_retry_interval,
         });
+
+        let mut sample_rate_by_level = Vec::new();
+        for (name, rate) in &config_for_processor.sample_rate_by_level {
+            if let Ok(level) = name.parse::<LogLevel>() {
+                sample_rate_by_level.push((level, *rate));
+            }
+        }
 
         let processor = EntryProcessor {
             min_level: config_for_processor
@@ -283,50 +460,78 @@ impl MicroLog {
                     compiled.ok()
                 }),
             sample_rate: config_for_processor.sample_rate,
+            sample_rate_by_level,
             enrichment: if config_for_processor.enrichment {
                 let (host, pid) = config_for_processor.host_and_process();
                 let service = config_for_processor
                     .service
                     .clone()
                     .unwrap_or_else(|| host.clone());
-                Some(crate::filter::EnrichmentContext { host, pid, service })
+                Some(crate::filter::EnrichmentContext {
+                    host,
+                    pid,
+                    service,
+                    env_vars: config_for_processor.enrichment_env_vars(),
+                })
             } else {
                 None
             },
         };
 
         let (batcher_stop_tx, batcher_stop_rx) = crossbeam_channel::bounded(0);
+        let (flush_tx, flush_rx) = crossbeam_channel::bounded::<()>(8);
 
         let inner = Arc::new(MicroLogInner {
-            sentinel: Sentinel::default(),
+            flush_waiters: Mutex::new(Vec::new()),
             config,
-            queue: LogQueue::new(queue_capacity),
+            queue: LogQueue::new(queue_capacity, queue_policy),
             processor,
             compressor: Compressor::from_config(&config_for_compressor),
             delivery_tx,
             batcher_stop_tx,
             batcher_stop_rx,
+            flush_tx,
+            flush_rx,
             engine: engine.clone(),
+            batcher: Worker {
+                handle: Mutex::new(None),
+                exit_rx: Mutex::new(None),
+            },
+            delivery: Worker {
+                handle: Mutex::new(None),
+                exit_rx: Mutex::new(None),
+            },
             stop_requested,
+            detached: AtomicBool::new(false),
             shutdown_done: AtomicBool::new(false),
             stats,
         });
 
-        // Delivery worker.
+        // Delivery worker (supervised against panics). Spawned after `inner`
+        // so both worker slots can be filled directly.
         let engine_arc = inner.engine.clone();
-        let handle = std::thread::Builder::new()
-            .name("tpt-microlog-delivery".into())
-            .spawn(move || engine_arc.run())
-            .expect("spawn delivery thread");
-        inner.sentinel.track_delivery(handle);
+        let delivery = Worker::spawn("tpt-microlog-delivery", move || {
+            supervised("delivery", move || engine_arc.run());
+        })
+        .expect("spawn delivery thread");
+        {
+            let slot = &inner.delivery;
+            *slot.handle.lock() = delivery.handle.lock().take();
+            *slot.exit_rx.lock() = delivery.exit_rx.lock().take();
+        }
 
-        // Batcher thread.
+        // Batcher thread (supervised against panics).
         let inner2 = inner.clone();
-        let handle = std::thread::Builder::new()
-            .name("tpt-microlog-batcher".into())
-            .spawn(move || run_batcher(inner2))
-            .expect("spawn batcher thread");
-        inner.sentinel.track_batcher(handle);
+        let batcher = Worker::spawn("tpt-microlog-batcher", move || {
+            supervised("batcher", move || run_batcher(inner2.clone()));
+        })
+        .expect("spawn batcher thread");
+
+        {
+            let slot = &inner.batcher;
+            *slot.handle.lock() = batcher.handle.lock().take();
+            *slot.exit_rx.lock() = batcher.exit_rx.lock().take();
+        }
 
         MicroLog { inner }
     }
@@ -359,9 +564,58 @@ impl MicroLog {
         self.inner.queue.len()
     }
 
-    fn emit(&self, entry: LogEntry) {
-        if let Some(processed) = self.inner.processor.process(&entry) {
-            self.inner.queue.push(processed);
+    /// Batches still waiting for the delivery worker.
+    pub fn inflight(&self) -> usize {
+        self.inner.engine.inflight()
+    }
+
+    /// Ask the batcher to flush buffered entries now and wait (bounded by
+    /// `shutdown_timeout_ms`) until the ingestion queue and dispatch channel
+    /// have drained. Returns `true` when everything is in flight or delivered.
+    pub fn flush(&self) -> bool {
+        let inner = &self.inner;
+        if inner.detached.load(Ordering::Relaxed) || inner.shutdown_done.load(Ordering::SeqCst) {
+            return inner.queue.is_empty() && inner.engine.inflight() == 0;
+        }
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded::<()>(1);
+        inner.flush_waiters.lock().push(ack_tx);
+        // Best-effort nudge; if a flush signal is already queued we are fine.
+        let _ = inner.flush_tx.try_send(());
+        let budget = Duration::from_millis(inner.config.shutdown_timeout_ms.max(1));
+        let _ = ack_rx.recv_timeout(budget);
+        // Wait for the queue and dispatch channel to drain.
+        let deadline = Instant::now() + budget;
+        while Instant::now() < deadline {
+            if inner.queue.is_empty() && inner.engine.inflight() == 0 {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        inner.queue.is_empty() && inner.engine.inflight() == 0
+    }
+
+    /// Called once in a forked child: worker threads do not exist there, so
+    /// the logger detaches (all calls become cheap no-ops) instead of
+    /// deadlocking the child.
+    pub fn detach_after_fork(&self) {
+        let inner = &self.inner;
+        inner.detached.store(true, Ordering::SeqCst);
+        inner.shutdown_done.store(true, Ordering::SeqCst);
+        inner.stop_requested.store(true, Ordering::SeqCst);
+    }
+
+    fn emit(&self, mut entry: LogEntry) {
+        let inner = &self.inner;
+        if inner.detached.load(Ordering::Relaxed) {
+            return;
+        }
+        if inner.processor.process(&mut entry) {
+            match inner.queue.push(entry) {
+                PushOutcome::Accepted => {}
+                PushOutcome::Dropped | PushOutcome::EvictedOldest => {
+                    inner.stats.dropped_entries.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
     }
 
@@ -434,26 +688,76 @@ impl MicroLog {
         self.emit(entry);
     }
 
-    /// Graceful shutdown: stops the batcher, flushes the final batch, drains
-    /// the delivery channel, then replays the WAL once before worker threads
-    /// exit (spec §2.7). Idempotent.
+    /// Graceful shutdown (spec §2.7): stops the batcher, flushes the final
+    /// batch, drains the delivery channel, then replays the WAL once before
+    /// worker threads exit. Idempotent, and bounded by
+    /// [`Config::shutdown_timeout_ms`] — when the budget expires, everything
+    /// still buffered spills to the WAL so the host app is never hung.
     pub fn shutdown(&self) {
-        if self.inner.shutdown_done.swap(true, Ordering::SeqCst) {
+        let inner = &self.inner;
+        if inner.shutdown_done.swap(true, Ordering::SeqCst) {
             return;
         }
+        if inner.detached.load(Ordering::SeqCst) {
+            return;
+        }
+        let budget = Duration::from_millis(inner.config.shutdown_timeout_ms.max(1));
+        let start = Instant::now();
+        let remaining = || budget.saturating_sub(start.elapsed());
+
         // 1. Ask the batcher to drain its queue, flush the final batch, and
         //    exit (rendezvous on the stop channel).
-        let _ = self
-            .inner
-            .batcher_stop_tx
-            .send_timeout((), std::time::Duration::from_secs(30));
-        // 2. Wait until the final batch is buffered in the delivery channel.
-        //    Only then flag the worker to stop, so it can never observe
-        //    `stop_requested && rx.is_empty()` before the final batch lands.
-        self.inner.sentinel.join_batcher();
-        self.inner.stop_requested.store(true, Ordering::SeqCst);
-        // 3. Join the delivery worker (drains channel + replays WAL once).
-        self.inner.sentinel.join_delivery();
+        if !remaining().is_zero() {
+            let _ = inner.batcher_stop_tx.send_timeout((), remaining());
+        }
+        // 2. Wait for the batcher. Only when it is done may the delivery
+        //    worker be told to stop, so the final batch is never abandoned
+        //    mid-drain.
+        if !inner.batcher.join_within(remaining()) {
+            // Out of budget: stop the workers and spill everything still
+            // buffered so nothing silently disappears.
+            inner.stop_requested.store(true, Ordering::SeqCst);
+            inner.spill_queue_to_wal();
+            inner.engine.spill_dispatch_to_wal();
+        }
+        // 3. Stop + join the delivery worker (drains channel + replays WAL).
+        inner.stop_requested.store(true, Ordering::SeqCst);
+        if !inner.delivery.join_within(remaining()) {
+            // Daemon: it holds only `Arc`s and will finish on its own.
+            inner.engine.spill_dispatch_to_wal();
+        }
+    }
+}
+
+impl MicroLogInner {
+    /// Drain the ingestion queue straight to the WAL, bypassing the (stuck)
+    /// batcher. Entries without a WAL are counted dropped.
+    fn spill_queue_to_wal(&self) {
+        let rx = self.queue.receiver();
+        let mut pending: Vec<LogEntry> = Vec::new();
+        while let Ok(entry) = rx.try_recv() {
+            pending.push(entry);
+        }
+        if pending.is_empty() {
+            return;
+        }
+        let count = pending.len();
+        let batch = Batch { entries: pending };
+        let cb = self.compressor.compress_batch(&batch, count);
+        let stored = self
+            .engine
+            .wal
+            .as_ref()
+            .map(|w| w.write(&cb).is_ok())
+            .unwrap_or(false);
+        if stored {
+            self.stats.wal_writes.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.stats.dropped_batches.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .dropped_entries
+                .fetch_add(count as u64, Ordering::Relaxed);
+        }
     }
 }
 
@@ -470,12 +774,13 @@ fn parse_filter_tags(raw: &[String]) -> Vec<(String, serde_json::Value)> {
 }
 
 /// Background batching thread (spec §5.2): flushes on time (1s), size (100),
-/// or memory (10MB) — whichever comes first (spec §4.2 step 3).
+/// or memory (10MB) — whichever comes first (spec §4.2 step 3) — plus on
+/// explicit `flush()` requests.
 fn run_batcher(inner: Arc<MicroLogInner>) {
     let rx = inner.queue.receiver();
     let flush_interval = std::time::Duration::from_millis(inner.config.flush_interval_ms);
     let ticker = crossbeam_channel::tick(flush_interval);
-    let mut pending: Vec<Arc<LogEntry>> = Vec::new();
+    let mut pending: Vec<LogEntry> = Vec::new();
     let mut pending_bytes: usize = 0;
 
     loop {
@@ -504,6 +809,16 @@ fn run_batcher(inner: Arc<MicroLogInner>) {
             recv(ticker) -> _ => {
                 flush_batch(&inner, &mut pending, &mut pending_bytes);
             },
+            recv(inner.flush_rx) -> _ => {
+                // Pull everything already queued so a flush covers every
+                // entry logged before the flush request, then flush + ack.
+                while let Ok(entry) = rx.try_recv() {
+                    pending_bytes += entry.approx_size();
+                    pending.push(entry);
+                }
+                flush_batch(&inner, &mut pending, &mut pending_bytes);
+                notify_flush_waiters(&inner);
+            },
             recv(inner.batcher_stop_rx) -> _ => {
                 // Graceful stop: keep pulling entries that arrive during the
                 // drain so nothing buffered in the queue is lost.
@@ -518,12 +833,20 @@ fn run_batcher(inner: Arc<MicroLogInner>) {
     }
 }
 
+/// Reply to every `flush()` caller waiting for the current flush.
+fn notify_flush_waiters(inner: &MicroLogInner) {
+    let waiters: Vec<Sender<()>> = inner.flush_waiters.lock().drain(..).collect();
+    for waiter in waiters {
+        let _ = waiter.try_send(());
+    }
+}
+
 /// Compress + dispatch a pending batch; resets accumulation.
-fn flush_batch(inner: &MicroLogInner, pending: &mut Vec<Arc<LogEntry>>, pending_bytes: &mut usize) {
+fn flush_batch(inner: &MicroLogInner, pending: &mut Vec<LogEntry>, pending_bytes: &mut usize) {
     if pending.is_empty() {
         return;
     }
-    let entries: Vec<LogEntry> = pending.drain(..).map(|a| (*a).clone()).collect();
+    let entries: Vec<LogEntry> = std::mem::take(pending);
     *pending_bytes = 0;
     let count = entries.len();
     let batch = Batch { entries };

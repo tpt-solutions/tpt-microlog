@@ -6,6 +6,7 @@
 *.whl
 __pycache__/
 *.pyc
+*.pyd
 .venv/
 
 # WASM build artifacts

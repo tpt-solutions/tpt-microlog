@@ -188,19 +188,22 @@ fn microlog_retries_then_delivers_over_http() {
     assert_eq!(decoded.entries.len(), 3);
 }
 
-/// Failure beyond max retries persists to the WAL; a second instance pointed at
-/// a healthy server drains it on the next poll (guaranteed delivery round-trip).
+/// Failure beyond max retries persists to the WAL; a second instance pointed
+/// at the (now healthy) endpoint drains it on the next poll — the guaranteed
+/// delivery round-trip. Both instances share service+backend+endpoint, so
+/// they resolve to the same WAL namespace by construction.
 #[test]
 fn wal_replay_after_permanent_outage() {
     let tmp = tempfile::tempdir().unwrap();
     let wal_dir = tmp.path().join("wal");
 
-    // Instance 1: backend down for the whole run.
-    let down = MockServer::start(vec![503]);
-    let down_transport = HttpTransport::new(&down.addr, vec![]);
+    // One endpoint: 503 for the first five requests, then 200 forever.
+    let server = MockServer::start(vec![503, 503, 503, 503, 503, 200]);
+
+    // Instance 1: backend down for the whole run (exhausts its 2 attempts).
     let cfg1 = tpt_log_core::Config {
         backend: "http".into(),
-        endpoint: Some(down.addr),
+        endpoint: Some(server.addr.clone()),
         wal_enabled: true,
         wal_dir: wal_dir.to_string_lossy().to_string(),
         flush_interval_ms: 5,
@@ -210,26 +213,33 @@ fn wal_replay_after_permanent_outage() {
         wal_retry_interval_ms: 20,
         ..tpt_log_core::Config::default()
     };
-    let log1 = MicroLog::new(cfg1, Arc::new(down_transport));
+    let down_transport = HttpTransport::new(&server.addr, vec![]);
+    let log1 = MicroLog::new(cfg1.clone(), Arc::new(down_transport));
     for i in 0..5 {
         log1.info(format!("lost-{i}"));
     }
     log1.shutdown();
+    drop(log1); // release the WAL namespace lock
 
-    // The batch landed in the WAL.
-    let wal = tpt_log_core::wal::Wal::open(&wal_dir, 10 * 1024 * 1024).unwrap();
+    // The batch landed in the WAL namespace this identity resolves to.
+    let ns_dir = cfg1.resolved_wal_dir().join(tpt_log_core::wal::namespace(
+        cfg1.service.as_deref(),
+        &cfg1.backend,
+        cfg1.endpoint.as_deref(),
+    ));
+    let wal = tpt_log_core::wal::Wal::open(&ns_dir, 10 * 1024 * 1024).unwrap();
     assert_eq!(
         wal.len(),
         1,
         "batch must be spooled to WAL after max retries"
     );
+    drop(wal); // release the namespace lock before instance 2 starts
 
-    // Instance 2: backend healthy now; drains the WAL within one poll interval.
-    let up = MockServer::start(vec![200]);
-    let up_transport = HttpTransport::new(&up.addr, vec![]);
+    // Instance 2: same identity, backend healthy now; drains the WAL.
+    let up_transport = HttpTransport::new(&server.addr, vec![]);
     let cfg2 = tpt_log_core::Config {
         backend: "http".into(),
-        endpoint: Some(up.addr.clone()),
+        endpoint: Some(server.addr.clone()),
         wal_enabled: true,
         wal_dir: wal_dir.to_string_lossy().to_string(),
         flush_interval_ms: 5,
@@ -240,23 +250,33 @@ fn wal_replay_after_permanent_outage() {
         ..tpt_log_core::Config::default()
     };
     let log2 = MicroLog::new(cfg2, Arc::new(up_transport));
-    // Give the replay thread a couple of poll intervals to succeed.
-    thread::sleep(std::time::Duration::from_millis(120));
+    // Give the replay thread a few poll intervals to burn through the
+    // canned 503s and reach the 200s.
+    thread::sleep(std::time::Duration::from_millis(300));
     log2.shutdown();
+    drop(log2); // release the WAL namespace lock
 
-    let mutual = tpt_log_core::wal::Wal::open(&wal_dir, 10 * 1024 * 1024).unwrap();
+    let mutual = tpt_log_core::wal::Wal::open(&ns_dir, 10 * 1024 * 1024).unwrap();
     assert_eq!(mutual.len(), 0, "WAL must drain after backend recovers");
 
-    // The replayed batch was delivered exactly once to the healthy server.
+    // The shared server rejected the first five requests (503) before
+    // recovering; every request after that succeeded. The spooled batch must
+    // have been delivered exactly once — never duplicated by the replay.
+    let total_requests = server.request_count();
+    assert!(
+        total_requests > 5,
+        "server should have seen the 503 phase and the recovery"
+    );
+    let successful = total_requests - 5;
+    assert_eq!(successful, 1, "replayed batch delivered exactly once");
+
     // `HttpTransport::new` uses JSON mode, so bodies decode without zstd.
-    let decoded_bodies = up
-        .bodies()
-        .iter()
-        .map(|b| tpt_log_core::Batch::from_json(b).unwrap())
-        .collect::<Vec<_>>();
-    let total_entries: usize = decoded_bodies.iter().map(|b| b.entries.len()).sum();
+    let binding = server.bodies();
+    let last_body = binding.last().unwrap();
+    let decoded = tpt_log_core::Batch::from_json(last_body).unwrap();
     assert_eq!(
-        total_entries, 5,
+        decoded.entries.len(),
+        5,
         "all five spooled entries replayed to healthy backend"
     );
 }

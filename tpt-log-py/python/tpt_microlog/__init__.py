@@ -12,7 +12,58 @@ Example:
     log.shutdown()
 """
 
-from tpt_microlog._native import MicroLog, load_config
+import atexit
+import os
+import weakref
+
+from tpt_microlog._native import MicroLog as _NativeMicroLog
+from tpt_microlog._native import load_config
 
 __all__ = ["MicroLog", "load_config"]
 __version__ = "0.1.0"
+
+# Live loggers (weakly held) so they can be flushed on interpreter exit and
+# detached in forked children, where the native worker threads do not exist.
+_live_loggers: "weakref.WeakSet" = weakref.WeakSet()
+
+
+class MicroLog(_NativeMicroLog):
+    """Native MicroLog with interpreter-exit and fork safety.
+
+    Usage:
+        log = MicroLog(backend="file", file_path="app.jsonl")
+        with log:               # shutdown on exit
+            log.info("hello", request_id="abc")
+    """
+
+    def __init__(self, *args, **kwargs):
+        # The native constructor runs via __new__ (which already received
+        # *args/**kwargs); __init__ must not forward them again.
+        super().__init__()
+        _live_loggers.add(self)
+
+    def shutdown(self, *args, **kwargs):
+        result = super().shutdown(*args, **kwargs)
+        _live_loggers.discard(self)
+        return result
+
+
+def _shutdown_all_at_exit() -> None:
+    for log in list(_live_loggers):
+        try:
+            log.shutdown()
+        except Exception:
+            pass  # never let teardown masking a crash
+
+
+def _detach_all_after_fork() -> None:
+    for log in list(_live_loggers):
+        try:
+            log._detach_after_fork()
+        except Exception:
+            pass
+
+
+atexit.register(_shutdown_all_at_exit)
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_detach_all_after_fork)

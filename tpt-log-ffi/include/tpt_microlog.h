@@ -32,7 +32,11 @@ enum tpt_log_code {
     TPT_LOG_NULL_ARGUMENT = 1,
     TPT_LOG_INVALID_UTF8 = 2,
     TPT_LOG_CONFIG_ERROR = 3,
-    TPT_LOG_INVALID_METADATA = 4
+    TPT_LOG_INVALID_METADATA = 4,
+    /** A panic escaped the engine; the process is still usable. */
+    TPT_LOG_PANIC = 5,
+    /** tpt_log_stats_json: buffer too small. */
+    TPT_LOG_STATS_TOO_SMALL = -2
 };
 
 /** Severity levels for tpt_log_log(). */
@@ -49,7 +53,8 @@ enum tpt_log_level {
  * Logger configuration. Zero-initialize (`= {0}`) and set only what you
  * need; NULL strings and zero numbers mean "use the default".
  *
- * `wal_enabled`: -1 (or 0/anything else) default, 0 disables, 1 forces on.
+ * `wal_enabled`: 0 (the zero-initialized value) keeps the default,
+ * positive forces on, negative forces off.
  * Strings are borrowed for the duration of the call only.
  */
 typedef struct tpt_log_config {
@@ -61,7 +66,7 @@ typedef struct tpt_log_config {
     double flush_interval;       /**< Flush interval seconds (0 -> default 1.0). */
     int32_t compression_level;   /**< zstd level (0 -> default 3). */
     int32_t max_retries;         /**< Delivery attempts (0 -> default 10). */
-    int32_t wal_enabled;         /**< -1 default, 0 off, 1 on. */
+    int32_t wal_enabled;         /**< 0 default, 1 on, <0 off. */
     const char* wal_dir;         /**< WAL directory (NULL -> platform default). */
 } tpt_log_config;
 
@@ -89,8 +94,33 @@ int32_t tpt_log_fatal(tpt_log_handle* handle, const char* message, const char* m
 /** Log with an explicit `enum tpt_log_level` code. */
 int32_t tpt_log_log(tpt_log_handle* handle, int32_t level, const char* message, const char* metadata);
 
+/**
+ * Log with an explicit level and metadata given as a JSON object string
+ * (e.g. "{\"user\":{\"id\":42}}"), supporting nested structures the flat
+ * "k=v,..." syntax cannot express. NULL/empty metadata logs without any.
+ */
+int32_t tpt_log_log_json(tpt_log_handle* handle, int32_t level, const char* message, const char* json_metadata);
+
 /** Record a numeric metric; `tags` uses the same "k=v,..." format or NULL. */
 int32_t tpt_log_metric(tpt_log_handle* handle, const char* name, double value, const char* tags);
+
+/**
+ * Flush buffered entries now, waiting up to the configured shutdown timeout.
+ * Returns TPT_LOG_OK (flush is best-effort; check tpt_log_stats_json after).
+ */
+int32_t tpt_log_flush(tpt_log_handle* handle);
+
+/**
+ * Write delivery statistics as a JSON object into `buf` (capacity `cap`,
+ * including the trailing NUL). Returns the number of bytes written on
+ * success; TPT_LOG_NULL_ARGUMENT for a NULL buffer and
+ * TPT_LOG_STATS_TOO_SMALL (-2) when `cap` is insufficient. A NULL handle
+ * reports all-zero counters. Example:
+ * {"delivered_batches":3,"delivered_entries":312,"wal_writes":0,
+ *  "retried_entries":0,"dropped_batches":0,"dropped_entries":0,
+ *  "queued":0,"inflight":0}
+ */
+int32_t tpt_log_stats_json(tpt_log_handle* handle, char* buf, size_t cap);
 
 /** Flush pending batches and drain the WAL. Idempotent. */
 int32_t tpt_log_shutdown(tpt_log_handle* handle);

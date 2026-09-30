@@ -7,10 +7,19 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ## [Unreleased]
 
-### Planned
+### Changed — Phase 9 reliability hardening
 
-- WebSocket and AWS Firehose transports.
-- Connection pooling metrics surfaced through `Transport::stats`.
+- HTTP status classification now treats 408/425/429 as rate-limited
+  (`TransportError::RateLimited`, honoring `Retry-After`) instead of
+  permanent; other 4xx stay permanent, 5xx/network stay transient.
+- `HttpTransport` JSON mode posts the JSON carried alongside the compressed
+  bytes (no decompress → parse → re-serialize round trip).
+- Datadog/CloudWatch adapters read credentials through the redacted `Secret`
+  wrapper; secret values never appear in `Debug`/serde output.
+
+### Added
+
+- `TransportError::RateLimited { message, retry_after_ms }`.
 
 ## [0.1.0] - 2026-09-29
 

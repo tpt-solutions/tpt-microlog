@@ -310,6 +310,7 @@ mod tests {
                 bytes,
                 entry_count: 1,
                 compressed: true,
+                raw_json: None,
             },
         }
     }

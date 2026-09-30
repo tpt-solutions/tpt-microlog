@@ -6,6 +6,15 @@ pub enum TransportError {
     /// Transport failed but may succeed on retry (network down, 5xx, timeout).
     #[error("transient transport failure: {0}")]
     Transient(String),
+    /// Backend asked us to slow down (HTTP 408/425/429). Retried like a
+    /// transient failure, but honors the server's `Retry-After` hint when
+    /// present.
+    #[error("rate limited: {message}")]
+    RateLimited {
+        message: String,
+        /// Server-requested delay in milliseconds (`Retry-After`).
+        retry_after_ms: Option<u64>,
+    },
     /// Transport failed permanently (4xx auth, bad payload). Do not retry.
     #[error("permanent transport failure: {0}")]
     Permanent(String),

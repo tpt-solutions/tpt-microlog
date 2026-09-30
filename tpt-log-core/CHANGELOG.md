@@ -7,10 +7,64 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ## [Unreleased]
 
-### Planned
+### Changed — Phase 9 reliability hardening
 
-- Replay statistics exposed through `Stats` for WAL recoveries.
-- Optional `mpsc` backpressure mode that blocks instead of dropping.
+- **WAL**: per-identity namespace directories (hash of service+backend+endpoint)
+  guarded by an OS file lock, so two processes never replay each other's
+  batches; unique pid+random filenames written via temp-file + atomic rename.
+- **WAL**: dead-letter directory (`wal/dead/`) after `wal_dead_letter_replays`
+  failed replay passes, with per-file attempt counters; corrupt files are
+  removed instead of blocking the queue forever.
+- **WAL**: O(1) size accounting (no per-write directory rescan), persisted
+  `entry_count` in the frame header (legacy frames still decode), and streaming
+  replay that reads one file at a time.
+- **Delivery**: replay passes stop at the first failure (circuit breaker) so a
+  dead backend never blocks live delivery; `durability = "wal-first"` writes
+  every batch to the WAL before the first send.
+- **Shutdown**: bounded by `shutdown_timeout_ms` (default 5 s); whatever is
+  still buffered when the budget expires spills to the WAL — `shutdown()` and
+  `Drop` never hang the host app.
+- **Queue**: configurable overflow policy (`block | drop_newest |
+  drop_oldest`) with a `dropped_entries` stat; the hot path no longer clones
+  each entry three times (processor clone → `Arc` → batch clone) and the
+  global byte-counter mutex is gone.
+- **Retry**: the first retry now waits the full base delay (off-by-one fixed),
+  delays carry de-synchronizing jitter, HTTP 408/425/429 are classified as
+  rate-limited (retrying with the server's `Retry-After`, capped), and the
+  dead duplicate `deliver_with_retry` loop was removed.
+- **Filtering**: metrics and trace spans bypass `min_level` and sampling;
+  WARN and above are never sampled; per-level sampling overrides
+  (`[sample_rate_by_level]`); `is_enabled()` accounts for regex/tag filters.
+- **Config**: parse errors and unknown keys (with "did you mean" hints) are
+  reported on stderr instead of being swallowed; `api_key`/`aws_secret_key`
+  are redacted in `Debug`/serde output; only a leading `~/` is expanded (fixes
+  Windows 8.3 short paths); `host_and_process()` returns the real hostname;
+  config discovery follows `$TPT_LOG_CONFIG` → `./` → user config → `/etc`.
+- **Env vars**: added `TPT_LOG_FILE_PATH`, `TPT_LOG_NET_ENDPOINT`,
+  `TPT_LOG_GRPC_ENDPOINT`, `TPT_LOG_EXTRA_HEADERS`, `TPT_LOG_PROMETHEUS_BIND`,
+  `TPT_LOG_QUEUE_CAPACITY`, `TPT_LOG_QUEUE_FULL_POLICY`,
+  `TPT_LOG_WAL_RETRY_INTERVAL_MS`, `TPT_LOG_DURABILITY`,
+  `TPT_LOG_SHUTDOWN_TIMEOUT_MS`, `TPT_LOG_ENRICH_ENV_VARS`, and the
+  `TPT_LOG_AWS_*` family.
+- **Workers**: batcher and delivery threads are supervised — a panic restarts
+  the worker (bounded) instead of silently killing telemetry.
+- Enrichment can capture selected environment variables into every entry
+  (`enrich_env_vars`).
+
+### Added
+
+- `MicroLog::flush()` — bounded, synchronous flush of buffered entries.
+- `MicroLog::inflight()`, `Stats::dropped_entries`, `detach_after_fork()`.
+- `QueueFullPolicy`, `Durability`, and `Secret` (redacted credential wrapper)
+  exported from the crate root.
+- `WalFrame` carries `entry_count`; `Wal::pending_paths()`/`read_frame()` for
+  streaming consumers; `Wal::namespace()` for identity derivation.
+
+### Fixed
+
+- Throughput re-measured after the hot-path rework: ~365k ingest /
+  ~347k end-to-end entries/sec (1 M entries, `none` backend) — measurably
+  faster than the 0.1.0 pipeline on identical hardware.
 
 ## [0.1.0] - 2026-09-29
 

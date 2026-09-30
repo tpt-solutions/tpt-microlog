@@ -37,6 +37,10 @@ struct Entry {
     log_type: String,
     message: String,
     metadata: serde_json::Map<String, serde_json::Value>,
+    /// In-memory retry counter (not serialized): batches that keep failing
+    /// with transient errors are dropped after `max_retries` attempts.
+    #[serde(default, skip_serializing)]
+    retries: u32,
 }
 
 fn now_ms() -> u64 {
@@ -54,9 +58,15 @@ struct Inner {
     batch_size: usize,
     flush_interval_ms: f64,
     max_retries_kept: usize,
+    /// Attempts a batch may stay buffered during outages before it is dropped.
+    max_retries: u32,
     timer: RefCell<Option<Closure<dyn FnMut()>>>,
     unload: RefCell<Option<Closure<dyn FnMut()>>>,
     stopped: RefCell<bool>,
+    /// Entries confirmed delivered (2xx) — mirrors `Stats.delivered_entries`.
+    delivered_entries: std::cell::Cell<u32>,
+    /// Entries dropped because the retry buffer overflowed.
+    dropped_entries: std::cell::Cell<u32>,
 }
 
 impl Inner {
@@ -99,6 +109,8 @@ impl Inner {
         combined.extend(buffer.drain(..));
         let overflow = combined.len().saturating_sub(self.max_retries_kept);
         combined.drain(..overflow);
+        self.dropped_entries
+            .set(self.dropped_entries.get() + overflow as u32);
         *buffer = combined;
     }
 
@@ -111,45 +123,66 @@ impl Inner {
         serde_json::to_vec(&serde_json::json!({ "entries": &*buffer })).ok()
     }
 
-    /// Take one batch and attempt delivery once. On failure the batch returns
-    /// to the front of the buffer (in-memory retry, spec §9).
+    /// Take one batch and attempt delivery once.
+    ///
+    /// - transient failure (network, 5xx, 408/425/429): the batch returns to
+    ///   the front of the buffer and retries on a later tick, up to
+    ///   `max_retries` attempts (in-memory retry, spec §9);
+    /// - permanent failure (other 4xx): the batch is dropped — it can never
+    ///   succeed, so re-queueing it would block every batch behind it.
     async fn flush_once(&self) {
         if self.endpoint.is_none() {
             self.buffer.borrow_mut().clear();
             return;
         }
-        let batch = self.take_batch();
+        let mut batch = self.take_batch();
         if batch.is_empty() {
             return;
         }
-        let body = serde_json::to_vec(&serde_json::json!({ "entries": batch })).unwrap_or_default();
+        let body =
+            serde_json::to_vec(&serde_json::json!({ "entries": &batch })).unwrap_or_default();
         let endpoint = self.endpoint.as_deref().unwrap_or_default();
-        if !send_batch(endpoint, &self.headers, &body).await {
-            // Re-parse is wasteful; keep the undelivered raw body instead.
-            self.requeue_from_body(&body);
-        }
-    }
-
-    /// Restore an undelivered batch body into the buffer.
-    fn requeue_from_body(&self, body: &[u8]) {
-        if let Ok(serde_json::Value::Object(map)) = serde_json::from_slice(body) {
-            if let Some(serde_json::Value::Array(entries)) = map.get("entries") {
-                let batch: Vec<Entry> = entries
-                    .iter()
-                    .filter_map(|e| serde_json::from_value(e.clone()).ok())
-                    .collect();
+        match send_batch(endpoint, &self.headers, &body).await {
+            SendOutcome::Delivered => {
+                self.delivered_entries
+                    .set(self.delivered_entries.get() + batch.len() as u32);
+            }
+            SendOutcome::Permanent => {
+                let dropped = batch.len() as u32;
+                self.dropped_entries
+                    .set(self.dropped_entries.get() + dropped);
+            }
+            SendOutcome::Transient => {
+                let before = batch.len();
+                let max = self.max_retries;
+                batch.retain_mut(|e| {
+                    e.retries += 1;
+                    e.retries < max
+                });
+                let expired = (before - batch.len()) as u32;
+                self.dropped_entries
+                    .set(self.dropped_entries.get() + expired);
                 self.requeue(batch);
             }
         }
     }
 }
 
-/// POST one batch via `fetch`. `true` = delivered (2xx).
-async fn send_batch(endpoint: &str, headers: &[(String, String)], body: &[u8]) -> bool {
+/// Result of one delivery attempt, classified like the native core.
+enum SendOutcome {
+    Delivered,
+    /// Network error, 5xx, or 408/425/429 — worth retrying later.
+    Transient,
+    /// Other 4xx — the backend will never accept this batch.
+    Permanent,
+}
+
+/// POST one batch via `fetch` and classify the response status.
+async fn send_batch(endpoint: &str, headers: &[(String, String)], body: &[u8]) -> SendOutcome {
     let global = js_sys::global();
     let fetch: Function = match js_sys::Reflect::get(&global, &"fetch".into()) {
         Ok(f) if f.is_function() => f.unchecked_into(),
-        _ => return false,
+        _ => return SendOutcome::Transient,
     };
     // `fetch` must be called with the global as `this` in browsers.
     let this: JsValue = if global.is_instance_of::<web_sys::Window>() {
@@ -164,27 +197,34 @@ async fn send_batch(endpoint: &str, headers: &[(String, String)], body: &[u8]) -
     init.set_body(&bytes.into());
     let request = match web_sys::Request::new_with_str_and_init(endpoint, &init) {
         Ok(r) => r,
-        Err(_) => return false,
+        Err(_) => return SendOutcome::Permanent,
     };
     let request_headers = request.headers();
     for (name, value) in headers {
         if request_headers.set(name, value).is_err() {
-            return false;
+            return SendOutcome::Permanent;
         }
     }
 
     let Ok(promise) = fetch.call1(&this, &request.into()) else {
-        return false;
+        return SendOutcome::Transient;
     };
     let Ok(promise) = promise.dyn_into::<js_sys::Promise>() else {
-        return false;
+        return SendOutcome::Transient;
     };
-    match wasm_bindgen_futures::JsFuture::from(promise).await {
-        Ok(resp) => match resp.dyn_into::<web_sys::Response>() {
-            Ok(resp) => resp.ok(),
-            Err(_) => false,
-        },
-        Err(_) => false,
+    let response = match wasm_bindgen_futures::JsFuture::from(promise).await {
+        Ok(resp) => resp,
+        Err(_) => return SendOutcome::Transient,
+    };
+    let Ok(response) = response.dyn_into::<web_sys::Response>() else {
+        return SendOutcome::Transient;
+    };
+    let status = response.status();
+    match status {
+        200..=299 => SendOutcome::Delivered,
+        0 | 408 | 425 | 429 | 500..=599 => SendOutcome::Transient,
+        // Other 4xx: retrying can never succeed.
+        _ => SendOutcome::Permanent,
     }
 }
 
@@ -290,6 +330,7 @@ impl MicroLog {
     /// - `minLevel` — drop entries below this level (default `"DEBUG"`)
     /// - `sampleRate` — fraction of entries kept, 0.0–1.0 (default 1.0)
     /// - `maxBuffer` — cap on buffered entries during outages (default 10 000)
+    /// - `maxRetries` — attempts before a transiently-failing batch is dropped (default 10)
     #[wasm_bindgen(constructor)]
     pub fn new(options: JsValue) -> MicroLog {
         let backend = option_str(&options, "backend").unwrap_or_default();
@@ -315,9 +356,12 @@ impl MicroLog {
             batch_size: option_f64(&options, "batchSize", 50.0).max(1.0) as usize,
             flush_interval_ms: (option_f64(&options, "flushInterval", 2.0) * 1000.0).max(50.0),
             max_retries_kept: option_f64(&options, "maxBuffer", 10_000.0).max(1.0) as usize,
+            max_retries: option_f64(&options, "maxRetries", 10.0).max(1.0) as u32,
             timer: RefCell::new(None),
             unload: RefCell::new(None),
             stopped: RefCell::new(false),
+            delivered_entries: std::cell::Cell::new(0),
+            dropped_entries: std::cell::Cell::new(0),
         });
         MicroLog { inner }.init()
     }
@@ -376,6 +420,22 @@ impl MicroLog {
     /// Entries currently buffered.
     pub fn queued(&self) -> usize {
         self.inner.buffer.borrow().len()
+    }
+
+    /// Delivery counters as a plain JS object:
+    /// `{ deliveredEntries, droppedEntries, queued, maxBuffer }`. The native
+    /// `stats()` shape (snake_case keys) is mirrored where applicable.
+    #[wasm_bindgen(js_name = stats)]
+    pub fn stats(&self) -> JsValue {
+        let obj = Object::new();
+        let set = |key: &str, value: u32| {
+            let _ = js_sys::Reflect::set(&obj, &key.into(), &value.into());
+        };
+        set("delivered_entries", self.inner.delivered_entries.get());
+        set("dropped_entries", self.inner.dropped_entries.get());
+        set("queued", self.inner.buffer.borrow().len() as u32);
+        set("max_buffer", self.inner.max_retries_kept as u32);
+        obj.into()
     }
 
     /// Deliver buffered entries immediately. Resolves with the number of
@@ -461,6 +521,7 @@ impl MicroLog {
             log_type: "metric".to_string(),
             message: name.to_string(),
             metadata,
+            retries: 0,
         });
     }
 
@@ -493,6 +554,7 @@ impl MicroLog {
             log_type: "trace".to_string(),
             message: name.to_string(),
             metadata,
+            retries: 0,
         });
     }
 
@@ -511,6 +573,7 @@ impl MicroLog {
             log_type: log_type.to_string(),
             message: message.to_string(),
             metadata: md,
+            retries: 0,
         });
     }
 

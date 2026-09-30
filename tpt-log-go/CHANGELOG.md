@@ -10,11 +10,20 @@ the versions published by `tpt-log-ffi`.
 
 ## [Unreleased]
 
-### Planned
+### Changed — Phase 9 reliability hardening
 
-- Context-aware variants (`InfoContext`, `ShutdownContext`) for callers that
-  need cancellation on process exit.
-- Span entry point once the core `span` API is exposed through the C ABI.
+- `Config.WalEnabled` is now explicit: `false` really disables the WAL (the
+  old mapping sent "default", which is on).
+- `MicroLog` guards the native handle with a `sync.RWMutex`, so `Close` cannot
+  free the handle while another goroutine is mid-call (verified under
+  `-race`); error reads pin the OS thread (`runtime.LockOSThread`) because the
+  native error buffer is thread-local.
+- Added `Config.WalDir` and `Config.CompressionLevel`.
+
+### Added
+
+- `MicroLog.Flush()` — bounded synchronous flush.
+- `MicroLog.Stats()` — delivery counters (`Stats` struct).
 
 ## [0.1.0] - 2026-09-29
 

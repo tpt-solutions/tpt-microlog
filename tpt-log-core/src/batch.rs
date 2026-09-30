@@ -35,22 +35,36 @@ impl Batch {
 /// Framed wire payload delivered to a transport.
 ///
 /// Carries the raw compressed bytes plus enough context to re-construct the
-/// original entries should a re-transport need them decoded.
+/// original entries should a re-transport need them decoded. When compression
+/// is active, the uncompressed JSON travels alongside (`raw_json`) so adapters
+/// that need plain JSON do not have to decompress, parse, and re-serialize.
 #[derive(Clone, Debug)]
 pub struct CompressedBatchPayload {
     pub bytes: Vec<u8>,
     pub entry_count: usize,
     pub compressed: bool,
+    /// Uncompressed batch JSON; `Some` exactly when `compressed` is true and
+    /// the payload originated from the in-process pipeline (WAL frames leave
+    /// it `None` and decode lazily).
+    pub raw_json: Option<std::sync::Arc<Vec<u8>>>,
 }
 
 impl CompressedBatchPayload {
+    /// Batch JSON without re-parsing: uses the carried raw JSON when present,
+    /// decompresses otherwise. Cheap for in-process batches.
+    pub fn json_bytes(&self) -> Result<Vec<u8>, String> {
+        if let Some(json) = &self.raw_json {
+            return Ok((**json).clone());
+        }
+        if !self.compressed {
+            return Ok(self.bytes.clone());
+        }
+        Compressor::decompress(&self.bytes).map_err(|e| format!("decompression failed: {e}"))
+    }
+
     /// Decode the original entries (used by tests / adapters / WAL).
     pub fn decode_entries(&self) -> Result<Vec<LogEntry>, String> {
-        let data = if self.compressed {
-            Compressor::decompress(&self.bytes)?
-        } else {
-            self.bytes.clone()
-        };
+        let data = self.json_bytes()?;
         Batch::from_json(&data)
             .map(|b| b.entries)
             .map_err(|e| e.to_string())
@@ -66,15 +80,7 @@ pub struct CompressedBatch {
 impl CompressedBatch {
     /// Reconstruct the decompressed entries (used by tests / adapters).
     pub fn decompress_entries(&self) -> Result<Vec<LogEntry>, String> {
-        let data = if self.payload.compressed {
-            Compressor::decompress(&self.payload.bytes)
-                .map_err(|e| format!("decompression failed: {e}"))?
-        } else {
-            self.payload.bytes.clone()
-        };
-        Batch::from_json(&data)
-            .map(|b| b.entries)
-            .map_err(|e| e.to_string())
+        self.payload.decode_entries()
     }
 }
 
@@ -137,6 +143,7 @@ impl Compressor {
                 bytes,
                 entry_count,
                 compressed: self.enabled,
+                raw_json: self.enabled.then(|| std::sync::Arc::new(json)),
             },
         }
     }

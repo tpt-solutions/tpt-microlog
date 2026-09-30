@@ -72,8 +72,7 @@ impl LogEntry {
     /// Approximate in-memory size useful for memory-based batching.
     pub fn approx_size(&self) -> usize {
         let base = self.message.len() + 32;
-        // Rough JSON-encoded metadata size.
-        base + self.metadata.len() * 48
+        base + self.metadata.values().map(json_size).sum::<usize>()
     }
 }
 
@@ -83,6 +82,24 @@ pub fn now_millis() -> u64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(d) => d.as_millis() as u64,
         Err(_) => 0,
+    }
+}
+
+/// Rough JSON-encoded size of a value (bytes, keys, and per-node overhead).
+fn json_size(value: &Value) -> usize {
+    use serde_json::Value as V;
+    const NODE_OVERHEAD: usize = 24;
+    match value {
+        V::Null | V::Bool(_) | V::Number(_) => NODE_OVERHEAD,
+        V::String(s) => s.len() + NODE_OVERHEAD,
+        V::Array(items) => NODE_OVERHEAD + items.iter().map(json_size).sum::<usize>(),
+        V::Object(map) => {
+            NODE_OVERHEAD
+                + map
+                    .iter()
+                    .map(|(k, v)| k.len() + json_size(v))
+                    .sum::<usize>()
+        }
     }
 }
 

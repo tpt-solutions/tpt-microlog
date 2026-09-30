@@ -2,44 +2,86 @@
 //!
 //! Embeds a tiny HTTP server on `prometheus_bind` and aggregates metric
 //! entries (`LogType::Metric`) into Prometheus text format served at `/metrics`.
+//!
+//! Series are keyed by metric name + label set (same name with different
+//! labels are distinct series), label keys are sanitized, label values are
+//! escaped, and exactly one `# TYPE` line is emitted per metric name.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
-use tpt_log_core::CompressedBatch;
-use tpt_log_core::{Config, LogEntry, Transport, TransportError};
+use tpt_log_core::{CompressedBatch, Config, LogEntry, Transport, TransportError};
 
 use crate::adapters::value_as_number;
 
-/// One recorded gauge sample.
-#[derive(Clone, Debug)]
-struct Sample {
-    name: String,
-    value: f64,
-    labels: Vec<(String, String)>,
+/// A series key: sorted `(label key, label value)` pairs.
+type LabelSet = Vec<(String, String)>;
+
+/// Aggregates latest gauge values per (metric name, label set).
+#[derive(Default)]
+struct Registry {
+    series: BTreeMap<String, BTreeMap<LabelSet, f64>>,
 }
 
-impl Sample {
-    /// Prometheus text line: `name{labels} value`.
-    fn render(&self) -> String {
-        let name = sanitize_name(&self.name);
-        if self.labels.is_empty() {
-            format!("{name} {}", self.value)
-        } else {
-            let labels: Vec<String> = self
-                .labels
-                .iter()
-                .map(|(k, v)| format!("{k}=\"{v}\""))
-                .collect();
-            format!("{name}{{{}}} {}", labels.join(","), self.value)
+impl Registry {
+    fn record(&mut self, entry: &LogEntry) {
+        let Some(value) = entry.metadata.get("value").and_then(value_as_number) else {
+            return;
+        };
+        let name = sanitize_name(&entry.message);
+        let mut labels: LabelSet = entry
+            .metadata
+            .get("tags")
+            .and_then(|t| t.as_object())
+            .map(|obj| {
+                obj.iter()
+                    .map(|(k, v)| {
+                        let value = match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        (sanitize_name(k), escape_label_value(&value))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        labels.sort();
+        self.series
+            .entry(name)
+            .or_default()
+            .insert(labels, value);
+    }
+
+    fn render_metrics(&self) -> Vec<u8> {
+        let mut out = String::new();
+        for (name, labelsets) in &self.series {
+            // One TYPE header per metric name, regardless of label sets.
+            out.push_str(&format!("# TYPE {name} gauge\n"));
+            for (labels, value) in labelsets {
+                if labels.is_empty() {
+                    out.push_str(&format!("{name} {value}\n"));
+                } else {
+                    let rendered: Vec<String> = labels
+                        .iter()
+                        .map(|(k, v)| format!("{k}=\"{v}\""))
+                        .collect();
+                    out.push_str(&format!("{name}{{{}}} {value}\n", rendered.join(",")));
+                }
+            }
         }
+        out.into_bytes()
     }
 }
 
+/// Replace every character outside `[a-zA-Z0-9_:]` with `_` and prefix a
+/// leading digit so the result is a valid Prometheus identifier.
 fn sanitize_name(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len() + 5);
+    let mut out = String::with_capacity(raw.len());
     for c in raw.chars() {
         if c.is_ascii_alphanumeric() || c == '_' || c == ':' {
             out.push(c);
@@ -53,53 +95,29 @@ fn sanitize_name(raw: &str) -> String {
     out
 }
 
-/// Aggregates latest gauge values per metric name (last-write-wins).
-#[derive(Default)]
-struct Registry {
-    samples: Vec<Sample>,
-}
-
-impl Registry {
-    fn record(&mut self, entry: &LogEntry) {
-        let Some(value) = entry.metadata.get("value").and_then(value_as_number) else {
-            return;
-        };
-        let labels: Vec<(String, String)> = entry
-            .metadata
-            .get("tags")
-            .and_then(|t| t.as_object())
-            .map(|obj| {
-                obj.iter()
-                    .map(|(k, v)| (k.clone(), v.as_str().map(String::from).unwrap_or_default()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        self.samples.retain(|s| s.name != entry.message);
-        self.samples.push(Sample {
-            name: entry.message.clone(),
-            value,
-            labels,
-        });
-    }
-
-    fn render_metrics(&self) -> Vec<u8> {
-        let mut out = String::new();
-        for s in &self.samples {
-            out.push_str(&format!(
-                "# TYPE {} gauge\n{}\n",
-                sanitize_name(&s.name),
-                s.render()
-            ));
+/// Escape a label value per the Prometheus text format
+/// (backslash, double quote, and newline).
+fn escape_label_value(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(c),
         }
-        out.into_bytes()
     }
+    out
 }
 
-/// Prometheus pull-model adapter. Serves `/metrics` on a bound TCP listener.
+/// Prometheus pull-model adapter. Serves `/metrics` on a bound TCP listener
+/// until [`PrometheusAdapter::stop`] is called (or the adapter is dropped).
 pub struct PrometheusAdapter {
-    _listener: Arc<Mutex<TcpListener>>,
+    listener: Arc<TcpListener>,
     metrics_url: String,
     registry: Arc<Mutex<Registry>>,
+    stop: Arc<AtomicBool>,
+    server: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl std::fmt::Debug for PrometheusAdapter {
@@ -120,20 +138,29 @@ impl PrometheusAdapter {
             .local_addr()
             .map_err(|e| TransportError::Config(format!("local_addr failed: {e}")))?;
         let metrics_url = format!("http://{addr}/metrics");
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| TransportError::Config(format!("nonblocking failed: {e}")))?;
 
-        let listener = Arc::new(Mutex::new(listener));
+        let listener = Arc::new(listener);
         let registry = Arc::new(Mutex::new(Registry::default()));
-        let listener_thread = listener.clone();
-        let registry_thread = registry.clone();
-        thread::Builder::new()
-            .name("tpt-microlog-prometheus".into())
-            .spawn(move || serve(listener_thread, registry_thread))
-            .expect("spawn prometheus listener");
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = {
+            let listener = listener.clone();
+            let registry = registry.clone();
+            let stop = stop.clone();
+            thread::Builder::new()
+                .name("tpt-microlog-prometheus".into())
+                .spawn(move || serve(listener, registry, stop))
+                .map_err(|e| TransportError::Config(format!("spawn prometheus thread: {e}")))?
+        };
 
         Ok(Self {
-            _listener: listener,
+            listener,
             metrics_url,
             registry,
+            stop,
+            server: Mutex::new(Some(server)),
         })
     }
 
@@ -146,49 +173,80 @@ impl PrometheusAdapter {
     pub fn metrics_url(&self) -> &str {
         &self.metrics_url
     }
+
+    /// Stop the embedded HTTP server (idempotent; also runs on `Drop`).
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.server.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            // Nudge the nonblocking accept loop awake; it exits within one
+            // poll interval of the flag being set.
+            let _ = handle.join();
+        }
+    }
 }
 
-fn serve(listener: Arc<Mutex<TcpListener>>, registry: Arc<Mutex<Registry>>) {
-    loop {
-        let (mut stream, _) = match listener.lock().unwrap().accept() {
-            Ok(pair) => pair,
-            Err(_) => return,
-        };
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-            .ok();
-        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
-        let mut request_line = String::new();
-        let mut content_length = 0usize;
-        let _ = reader.read_line(&mut request_line);
-        loop {
-            let mut line = String::new();
-            if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" || line == "\n" {
-                break;
-            }
-            if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                content_length = v.trim().parse().unwrap_or(0);
-            }
-        }
-        // Swallow any body bytes (POSTs) without waiting on keep-alive sockets.
-        if content_length > 0 {
-            let mut rest = vec![0u8; content_length];
-            let _ = reader.read_exact(&mut rest);
-        }
-
-        let path = request_line.split_whitespace().nth(1).unwrap_or("/");
-        let body = if path.starts_with("/metrics") {
-            registry.lock().unwrap().render_metrics()
-        } else {
-            b"tpt-microlog prometheus exporter".to_vec()
-        };
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        let _ = stream.write_all(resp.as_bytes());
-        let _ = stream.write_all(&body);
+impl Drop for PrometheusAdapter {
+    fn drop(&mut self) {
+        self.stop();
     }
+}
+
+fn serve(listener: Arc<TcpListener>, registry: Arc<Mutex<Registry>>, stop: Arc<AtomicBool>) {
+    let poll = Duration::from_millis(50);
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                handle_connection(&mut stream, &registry);
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(poll);
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+fn handle_connection(stream: &mut std::net::TcpStream, registry: &Arc<Mutex<Registry>>) {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .ok();
+    let Ok(raw) = stream.try_clone() else {
+        return;
+    };
+    let mut reader = BufReader::new(raw);
+    let mut request_line = String::new();
+    let mut content_length = 0usize;
+    let _ = reader.read_line(&mut request_line);
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" || line == "\n" {
+            break;
+        }
+        if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+            content_length = v.trim().parse().unwrap_or(0);
+        }
+    }
+    // Swallow any body bytes (POSTs) without waiting on keep-alive sockets.
+    if content_length > 0 {
+        let mut rest = vec![0u8; content_length.min(1 << 20)];
+        let _ = reader.read_exact(&mut rest);
+    }
+
+    let path = request_line.split_whitespace().nth(1).unwrap_or("/");
+    let body = match registry.lock() {
+        Ok(reg) if path.starts_with("/metrics") => reg.render_metrics(),
+        Ok(_) => b"tpt-microlog prometheus exporter".to_vec(),
+        Err(_) => return,
+    };
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(resp.as_bytes());
+    let _ = stream.write_all(&body);
 }
 
 impl Transport for PrometheusAdapter {
@@ -196,7 +254,7 @@ impl Transport for PrometheusAdapter {
         let entries = batch
             .decompress_entries()
             .map_err(|e| TransportError::Rejected(format!("decode failed: {e}")))?;
-        let mut reg = self.registry.lock().unwrap();
+        let mut reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
         for e in &entries {
             reg.record(e);
         }
@@ -211,11 +269,63 @@ impl Transport for PrometheusAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tpt_log_core::{LogLevel, LogType};
 
     #[test]
     fn name_sanitizes_chars() {
         assert_eq!(sanitize_name("cpu.usage"), "cpu_usage");
         assert_eq!(sanitize_name("42users"), "_42users");
         assert_eq!(sanitize_name("http_status"), "http_status");
+        assert_eq!(sanitize_name("latency-ms"), "latency_ms");
+    }
+
+    #[test]
+    fn label_values_are_escaped() {
+        assert_eq!(escape_label_value("say \"hi\""), "say \\\"hi\\\"");
+        assert_eq!(escape_label_value("back\\slash"), "back\\\\slash");
+        assert_eq!(escape_label_value("line1\nline2"), "line1\\nline2");
+    }
+
+    fn metric_entry(name: &str, value: f64, tags: serde_json::Value) -> LogEntry {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("value".into(), serde_json::json!(value));
+        if !tags.is_null() {
+            metadata.insert("tags".into(), tags);
+        }
+        LogEntry {
+            timestamp: 1,
+            level: LogLevel::Info,
+            log_type: LogType::Metric,
+            message: name.into(),
+            metadata,
+        }
+    }
+
+    #[test]
+    fn same_name_different_labels_are_distinct_series() {
+        let mut reg = Registry::default();
+        reg.record(&metric_entry("cpu", 1.0, serde_json::json!({"host": "a"})));
+        reg.record(&metric_entry("cpu", 2.0, serde_json::json!({"host": "b"})));
+        reg.record(&metric_entry("cpu", 9.0, serde_json::json!({"host": "a"}))); // overwrite
+        let text = String::from_utf8(reg.render_metrics()).unwrap();
+        assert_eq!(text.matches("# TYPE cpu gauge").count(), 1, "{text}");
+        assert!(text.contains("cpu{host=\"a\"} 9"));
+        assert!(text.contains("cpu{host=\"b\"} 2"));
+        assert_eq!(text.lines().count(), 3, "{text}");
+    }
+
+    #[test]
+    fn label_keys_sanitized_and_values_escaped_in_render() {
+        let mut reg = Registry::default();
+        reg.record(&metric_entry(
+            "req",
+            3.0,
+            serde_json::json!({"path/odd": "a\"b", "ok": "x\ny"}),
+        ));
+        let text = String::from_utf8(reg.render_metrics()).unwrap();
+        assert!(
+            text.contains("req{ok=\"x\\ny\",path_odd=\"a\\\"b\"} 3"),
+            "{text}"
+        );
     }
 }

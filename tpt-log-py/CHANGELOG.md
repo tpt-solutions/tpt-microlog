@@ -9,11 +9,21 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Planned
+### Changed — Phase 9 reliability hardening
 
-- Async context-manager support (`async with MicroLog(...)`).
-- Native `logging.Handler` integration for standard-library drop-in use.
-- Linux `aarch64` and Windows `aarch64` wheels in CI.
+- Blocking calls (`shutdown`, `flush`, constructor) release the GIL while the
+  engine works.
+- NaN/Infinity metadata is kept as `"NaN"`/`"Infinity"` strings instead of
+  raising `ValueError` — a float edge case can no longer break a log call.
+- The Python-level `MicroLog` subclasses the native class and is registered
+  for `atexit` shutdown and `os.register_at_fork` handling (children detach
+  instead of deadlocking on the missing worker threads).
+- `api_key`/`aws_secret_key` are redacted in repr/serde output.
+
+### Added
+
+- `flush()`, `stats()` (dict of delivery counters), context-manager support
+  (`with MicroLog(...) as log:`), and `_detach_after_fork()`.
 
 ## [0.1.0] - 2026-09-29
 

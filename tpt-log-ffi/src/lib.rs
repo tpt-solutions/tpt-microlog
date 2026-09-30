@@ -17,7 +17,7 @@ use std::ptr;
 use std::sync::Arc;
 
 use serde_json::Value;
-use tpt_log_core::{Config, LogLevel, MicroLog as CoreLog};
+use tpt_log_core::{Config, LogLevel, MicroLog as CoreLog, Secret};
 use tpt_log_transport::build_transport;
 
 /// Error codes returned by every fallible entry point (`TPT_LOG_OK` == 0).
@@ -30,6 +30,10 @@ mod codes {
     pub const INVALID_UTF8: i32 = 2;
     pub const CONFIG_ERROR: i32 = 3;
     pub const INVALID_METADATA: i32 = 4;
+    /// A panic escaped the engine; the process is still usable.
+    pub const PANIC: i32 = 5;
+    /// Stats buffer too small (returned as a negative by `tpt_log_stats_json`).
+    pub const STATS_TOO_SMALL: i32 = -2;
 }
 
 /// Opaque logger handle (spec §6.5 `tpt_log_handle`).
@@ -127,7 +131,7 @@ fn config_from(raw: &TptLogConfig) -> Result<Config, i32> {
         config.backend = backend;
     }
     config.endpoint = opt_str(raw.endpoint)?;
-    config.api_key = opt_str(raw.api_key)?;
+    config.api_key = opt_str(raw.api_key)?.map(Secret::new);
     config.service = opt_str(raw.service)?;
     config.wal_dir = match opt_str(raw.wal_dir)? {
         Some(dir) => dir,
@@ -145,8 +149,10 @@ fn config_from(raw: &TptLogConfig) -> Result<Config, i32> {
     if raw.max_retries > 0 {
         config.max_retries = raw.max_retries as u32;
     }
+    // Tri-state, zero-init friendly: 0 (the zero-initialized value) keeps the
+    // default, positive forces on, negative forces off.
     match raw.wal_enabled {
-        0 => config.wal_enabled = false,
+        n if n < 0 => config.wal_enabled = false,
         1 => config.wal_enabled = true,
         _ => {}
     }
@@ -169,9 +175,32 @@ pub struct TptLogConfig {
     pub compression_level: i32,
     /// Delivery attempts (0 → default 10).
     pub max_retries: i32,
-    /// -1 default, 0 off, 1 on.
+    /// 0 default, 1 on, negative off.
     pub wal_enabled: i32,
     pub wal_dir: *const c_char,
+}
+
+/// Panic barrier: a bug inside the engine must never unwind across the C ABI.
+/// Panics map to [`codes::PANIC`] with a message on `tpt_log_last_error`.
+fn guarded(body: impl FnOnce() -> i32) -> i32 {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(code) => code,
+        Err(_) => {
+            set_last_error("tpt-microlog: internal panic inside the logging engine");
+            codes::PANIC
+        }
+    }
+}
+
+/// Panic barrier for constructors: panics map to a NULL handle.
+fn guarded_ptr<T>(body: impl FnOnce() -> *mut T) -> *mut T {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(ptr) => ptr,
+        Err(_) => {
+            set_last_error("tpt-microlog: internal panic inside the logging engine");
+            ptr::null_mut()
+        }
+    }
 }
 
 /// Create a logger. Returns NULL on configuration failure; check
@@ -182,29 +211,31 @@ pub struct TptLogConfig {
 /// (all defaults). All borrowed strings must outlive the call.
 #[no_mangle]
 pub unsafe extern "C" fn tpt_log_create(config: *const TptLogConfig) -> *mut MicroLogHandle {
-    let built = match (!config.is_null())
-        .then(|| config.read())
-        .map(|raw| config_from(&raw))
-    {
-        None => Config::load(),
-        Some(Ok(cfg)) => cfg,
-        Some(Err(code)) => {
-            set_last_error(&format!("tpt_log_create failed (code {code})"));
-            return ptr::null_mut();
+    guarded_ptr(|| {
+        let built = match (!config.is_null())
+            .then(|| config.read())
+            .map(|raw| config_from(&raw))
+        {
+            None => Config::load(),
+            Some(Ok(cfg)) => cfg,
+            Some(Err(code)) => {
+                set_last_error(&format!("tpt_log_create failed (code {code})"));
+                return ptr::null_mut();
+            }
+        };
+        match build_transport(&built) {
+            Ok(transport) => {
+                let handle = Box::new(MicroLogHandle {
+                    inner: CoreLog::new(built, Arc::from(transport)),
+                });
+                Box::into_raw(handle)
+            }
+            Err(e) => {
+                set_last_error(&format!("tpt_log_create: {e}"));
+                ptr::null_mut()
+            }
         }
-    };
-    match build_transport(&built) {
-        Ok(transport) => {
-            let handle = Box::new(MicroLogHandle {
-                inner: CoreLog::new(built, Arc::from(transport)),
-            });
-            Box::into_raw(handle)
-        }
-        Err(e) => {
-            set_last_error(&format!("tpt_log_create: {e}"));
-            ptr::null_mut()
-        }
-    }
+    })
 }
 
 /// Shared logging path for the level-specific functions.
@@ -248,7 +279,7 @@ pub unsafe extern "C" fn tpt_log_trace(
     message: *const c_char,
     metadata: *const c_char,
 ) -> i32 {
-    log_at(handle, LogLevel::Trace, message, metadata)
+    guarded(|| log_at(handle, LogLevel::Trace, message, metadata))
 }
 
 /// # Safety
@@ -259,7 +290,7 @@ pub unsafe extern "C" fn tpt_log_debug(
     message: *const c_char,
     metadata: *const c_char,
 ) -> i32 {
-    log_at(handle, LogLevel::Debug, message, metadata)
+    guarded(|| log_at(handle, LogLevel::Debug, message, metadata))
 }
 
 /// # Safety
@@ -270,7 +301,7 @@ pub unsafe extern "C" fn tpt_log_info(
     message: *const c_char,
     metadata: *const c_char,
 ) -> i32 {
-    log_at(handle, LogLevel::Info, message, metadata)
+    guarded(|| log_at(handle, LogLevel::Info, message, metadata))
 }
 
 /// # Safety
@@ -281,7 +312,7 @@ pub unsafe extern "C" fn tpt_log_warn(
     message: *const c_char,
     metadata: *const c_char,
 ) -> i32 {
-    log_at(handle, LogLevel::Warn, message, metadata)
+    guarded(|| log_at(handle, LogLevel::Warn, message, metadata))
 }
 
 /// # Safety
@@ -292,7 +323,7 @@ pub unsafe extern "C" fn tpt_log_error(
     message: *const c_char,
     metadata: *const c_char,
 ) -> i32 {
-    log_at(handle, LogLevel::Error, message, metadata)
+    guarded(|| log_at(handle, LogLevel::Error, message, metadata))
 }
 
 /// # Safety
@@ -303,7 +334,7 @@ pub unsafe extern "C" fn tpt_log_fatal(
     message: *const c_char,
     metadata: *const c_char,
 ) -> i32 {
-    log_at(handle, LogLevel::Fatal, message, metadata)
+    guarded(|| log_at(handle, LogLevel::Fatal, message, metadata))
 }
 
 /// Log with an explicit level code (see `tpt_log_level` in the header).
@@ -317,10 +348,10 @@ pub unsafe extern "C" fn tpt_log_log(
     message: *const c_char,
     metadata: *const c_char,
 ) -> i32 {
-    match level_from_code(level) {
+    guarded(|| match level_from_code(level) {
         Some(level) => log_at(handle, level, message, metadata),
         None => codes::NULL_ARGUMENT,
-    }
+    })
 }
 
 /// Record a numeric metric (spec §6.5).
@@ -334,23 +365,25 @@ pub unsafe extern "C" fn tpt_log_metric(
     value: f64,
     tags: *const c_char,
 ) -> i32 {
-    if handle.is_null() {
-        return codes::NULL_ARGUMENT;
-    }
-    let Some(Ok(name)) = str_from_ptr(name) else {
-        return codes::NULL_ARGUMENT;
-    };
-    let tag_map = match parse_metadata(tags) {
-        Ok(map) => map,
-        Err(code) => return code,
-    };
-    let tags = if tag_map.is_empty() {
-        None
-    } else {
-        Some(&tag_map)
-    };
-    (*handle).inner.metric(name, value, tags);
-    codes::OK
+    guarded(|| {
+        if handle.is_null() {
+            return codes::NULL_ARGUMENT;
+        }
+        let Some(Ok(name)) = str_from_ptr(name) else {
+            return codes::NULL_ARGUMENT;
+        };
+        let tag_map = match parse_metadata(tags) {
+            Ok(map) => map,
+            Err(code) => return code,
+        };
+        let tags = if tag_map.is_empty() {
+            None
+        } else {
+            Some(&tag_map)
+        };
+        (*handle).inner.metric(name, value, tags);
+        codes::OK
+    })
 }
 
 /// Flush pending batches and drain the WAL. Idempotent.
@@ -359,11 +392,13 @@ pub unsafe extern "C" fn tpt_log_metric(
 /// `handle` must be a live handle or NULL (NULL is a no-op).
 #[no_mangle]
 pub unsafe extern "C" fn tpt_log_shutdown(handle: *mut MicroLogHandle) -> i32 {
-    if handle.is_null() {
-        return codes::NULL_ARGUMENT;
-    }
-    (*handle).inner.shutdown();
-    codes::OK
+    guarded(|| {
+        if handle.is_null() {
+            return codes::NULL_ARGUMENT;
+        }
+        (*handle).inner.shutdown();
+        codes::OK
+    })
 }
 
 /// Destroy a handle created by `tpt_log_create` (flushes implicitly).
@@ -374,9 +409,11 @@ pub unsafe extern "C" fn tpt_log_shutdown(handle: *mut MicroLogHandle) -> i32 {
 /// before.
 #[no_mangle]
 pub unsafe extern "C" fn tpt_log_destroy(handle: *mut MicroLogHandle) {
-    if !handle.is_null() {
-        drop(Box::from_raw(handle));
-    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !handle.is_null() {
+            drop(Box::from_raw(handle));
+        }
+    }));
 }
 
 /// Entries still buffered in the ingestion queue.
@@ -390,6 +427,131 @@ pub unsafe extern "C" fn tpt_log_queued(handle: *mut MicroLogHandle) -> usize {
     } else {
         (*handle).inner.queued()
     }
+}
+
+/// Log with an explicit level code and metadata given as a JSON object string
+/// (`{"user":{"id":42}}`), supporting nested structures that the flat
+/// `k=v,k2=v2` syntax cannot express.
+///
+/// # Safety
+/// Same contract as `tpt_log_log`; `json_metadata` must be a valid UTF-8 JSON
+/// object or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn tpt_log_log_json(
+    handle: *mut MicroLogHandle,
+    level: i32,
+    message: *const c_char,
+    json_metadata: *const c_char,
+) -> i32 {
+    guarded(|| {
+        let Some(level) = level_from_code(level) else {
+            return codes::NULL_ARGUMENT;
+        };
+        if handle.is_null() {
+            return codes::NULL_ARGUMENT;
+        }
+        let Some(Ok(message)) = str_from_ptr(message) else {
+            return codes::NULL_ARGUMENT;
+        };
+        let metadata: serde_json::Map<String, Value> = match str_from_ptr(json_metadata) {
+            None => serde_json::Map::new(),
+            Some(Err(code)) => return code,
+            Some(Ok("")) => serde_json::Map::new(),
+            Some(Ok(raw)) => match serde_json::from_str::<Value>(raw) {
+                Ok(Value::Object(map)) => map,
+                _ => return codes::INVALID_METADATA,
+            },
+        };
+        if metadata.is_empty() {
+            match level {
+                LogLevel::Trace => (*handle).inner.trace(message),
+                LogLevel::Debug => (*handle).inner.debug(message),
+                LogLevel::Info => (*handle).inner.info(message),
+                LogLevel::Warn => (*handle).inner.warn(message),
+                LogLevel::Error => (*handle).inner.error(message),
+                LogLevel::Fatal => (*handle).inner.fatal(message),
+            }
+        } else {
+            (*handle).inner.log_with(level, message, metadata);
+        }
+        codes::OK
+    })
+}
+
+/// Flush buffered entries now (bounded by the configured shutdown timeout).
+///
+/// # Safety
+/// `handle` must be a live handle or NULL (NULL is a no-op).
+#[no_mangle]
+pub unsafe extern "C" fn tpt_log_flush(handle: *mut MicroLogHandle) -> i32 {
+    guarded(|| {
+        if handle.is_null() {
+            return codes::NULL_ARGUMENT;
+        }
+        (*handle).inner.flush();
+        codes::OK
+    })
+}
+
+/// Delivery statistics as a JSON object written into `buf` (capacity `cap`,
+/// including the trailing NUL). Returns the number of bytes written on
+/// success, or a negative error code: `TPT_LOG_NULL_ARGUMENT` / `-2` when the
+/// buffer is too small.
+///
+/// # Safety
+/// `handle` must be a live handle or NULL (NULL reports zeros); `buf` must be
+/// writable for `cap` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn tpt_log_stats_json(
+    handle: *mut MicroLogHandle,
+    buf: *mut c_char,
+    cap: usize,
+) -> i32 {
+    guarded(|| {
+        if buf.is_null() {
+            return codes::NULL_ARGUMENT;
+        }
+        let relaxed = std::sync::atomic::Ordering::Relaxed;
+        let (stats, queued, inflight) = if handle.is_null() {
+            (None, 0, 0)
+        } else {
+            // SAFETY: caller contract (live handle or NULL).
+            let inner = unsafe { &(*handle).inner };
+            (
+                Some(inner.stats() as &tpt_log_core::microlog::Stats),
+                inner.queued(),
+                inner.inflight(),
+            )
+        };
+        macro_rules! field {
+            ($c:ident) => {
+                stats.map(|s| s.$c.load(relaxed)).unwrap_or(0)
+            };
+        }
+        let json = format!(
+            "{{\"delivered_batches\":{},\"delivered_entries\":{},\"wal_writes\":{},\
+             \"retried_entries\":{},\"dropped_batches\":{},\"dropped_entries\":{},\
+             \"queued\":{},\"inflight\":{}}}",
+            field!(delivered_batches),
+            field!(delivered_entries),
+            field!(wal_writes),
+            field!(retried_entries),
+            field!(dropped_batches),
+            field!(dropped_entries),
+            queued,
+            inflight,
+        );
+        let needed = json.len() + 1;
+        if cap < needed {
+            return codes::STATS_TOO_SMALL;
+        }
+        let Ok(bytes) = std::ffi::CString::new(json) else {
+            return codes::PANIC;
+        };
+        // SAFETY: caller guarantees `cap >= needed` writable bytes at `buf`.
+        ptr::copy_nonoverlapping(bytes.as_ptr(), buf.cast(), needed);
+        needed as i32
+    })
 }
 
 /// Library version string (static, valid for the program lifetime).
@@ -438,7 +600,7 @@ mod tests {
             flush_interval: 0.05,
             compression_level: 0,
             max_retries: 1,
-            wal_enabled: 0,
+            wal_enabled: -1,
             wal_dir: wal_dir.as_ptr(),
         };
         let handle = unsafe { tpt_log_create(&cfg) };
@@ -508,5 +670,50 @@ mod tests {
         let ptr = tpt_log_version();
         let s = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap();
         assert!(s.split('.').count() == 3, "version: {s}");
+    }
+
+    #[test]
+    fn zero_init_config_means_defaults() {
+        // Zero-initialized config must be accepted and keep the WAL default
+        // (on): the old ABI treated wal_enabled == 0 as "off".
+        let handle = unsafe { tpt_log_create(ptr::null()) };
+        assert!(!handle.is_null());
+        unsafe { tpt_log_destroy(handle) };
+    }
+
+    #[test]
+    fn log_json_and_stats_and_flush() {
+        let (handle, _guard) = make_logger();
+        let msg = c"nested";
+        let md = c"{\"user\":{\"id\":42},\"tags\":[\"a\",\"b\"]}";
+        assert_eq!(
+            unsafe { tpt_log_log_json(handle, 2, msg.as_ptr(), md.as_ptr()) },
+            0
+        );
+        // Malformed JSON is rejected.
+        let bad = c"{not json}";
+        assert_eq!(
+            unsafe { tpt_log_log_json(handle, 2, msg.as_ptr(), bad.as_ptr()) },
+            codes::INVALID_METADATA
+        );
+        assert_eq!(unsafe { tpt_log_flush(handle) }, 0);
+
+        let mut buf = vec![0u8; 512];
+        let written = unsafe { tpt_log_stats_json(handle, buf.as_mut_ptr().cast(), buf.len()) };
+        assert!(written > 0, "stats must be written");
+        let text = unsafe { CStr::from_ptr(buf.as_ptr().cast()) }
+            .to_str()
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["delivered_batches"], 1, "flush must deliver");
+        assert_eq!(parsed["queued"], 0);
+
+        // Too-small buffer reports the dedicated error code.
+        let mut tiny = [0u8; 4];
+        assert_eq!(
+            unsafe { tpt_log_stats_json(handle, tiny.as_mut_ptr().cast(), tiny.len()) },
+            codes::STATS_TOO_SMALL
+        );
+        unsafe { tpt_log_destroy(handle) };
     }
 }

@@ -102,58 +102,58 @@
 ## Phase 9 — Reliability Hardening (from platform review)
 
 ### WAL & delivery
-- [ ] WAL: namespace dir by hash(service+backend+endpoint); add lock file so processes never replay each other's batches
-- [ ] WAL: unique filenames (pid + random) and atomic write (temp file + rename)
-- [ ] WAL: dead-letter dir (`wal/dead/`) after N failed replays; per-file attempt counter
-- [ ] WAL: O(1) size accounting (stop re-listing dir on every write); stream `pending()` instead of loading all files
-- [ ] WAL: persist `entry_count` so `Stats.retried_entries` is correct
-- [ ] `shutdown()`/`Drop`: add `shutdown_timeout_ms`; spill remaining batches to WAL on expiry (never hang the host app)
-- [ ] Replay: stop pass at first failure (circuit breaker) or move to separate thread so live delivery is never blocked
-- [ ] Queue overflow policy: `block | drop_newest | drop_oldest` + `dropped_entries` stat
-- [ ] Supervise batcher/delivery threads (panic recovery, no `unwrap`/`expect` in worker paths)
-- [ ] Optional `durability = "wal-first"` mode; reword README "100% delivery" claim to at-least-once on graceful shutdown
+- [x] WAL: namespace dir by hash(service+backend+endpoint); add lock file so processes never replay each other's batches
+- [x] WAL: unique filenames (pid + random) and atomic write (temp file + rename)
+- [x] WAL: dead-letter dir (`wal/dead/`) after N failed replays; per-file attempt counter
+- [x] WAL: O(1) size accounting (stop re-listing dir on every write); stream `pending()` instead of loading all files
+- [x] WAL: persist `entry_count` so `Stats.retried_entries` is correct
+- [x] `shutdown()`/`Drop`: add `shutdown_timeout_ms`; spill remaining batches to WAL on expiry (never hang the host app)
+- [x] Replay: stop pass at first failure (circuit breaker) or move to separate thread so live delivery is never blocked
+- [x] Queue overflow policy: `block | drop_newest | drop_oldest` + `dropped_entries` stat
+- [x] Supervise batcher/delivery threads (panic recovery, no `unwrap`/`expect` in worker paths)
+- [x] Optional `durability = "wal-first"` mode; reword README "100% delivery" claim to at-least-once on graceful shutdown
 
 ### Retry & classification
-- [ ] Treat HTTP 408/425/429 as transient; honor `Retry-After`
-- [ ] Fix backoff off-by-one (first retry currently immediate) and add jitter
-- [ ] Remove dead duplicate `deliver_with_retry` in `retry.rs`
+- [x] Treat HTTP 408/425/429 as transient; honor `Retry-After`
+- [x] Fix backoff off-by-one (first retry currently immediate) and add jitter
+- [x] Remove dead duplicate `deliver_with_retry` in `retry.rs`
 
 ### Config & security
-- [ ] Surface `tpt-log.toml` parse errors instead of silently defaulting; warn on unknown keys (`deny_unknown_fields`)
-- [ ] Fix README sample config (`[endpoint]` table breaks parsing)
-- [ ] Redact secrets in `Debug`/`Serialize` (`Secret<String>` for `api_key`, `aws_secret_key`)
-- [ ] Only expand leading `~/` in `wal_dir` (currently corrupts Windows 8.3 paths)
-- [ ] `host_and_process()` must return real hostname, not `service`; implement env-var enrichment
-- [ ] Expand env-var coverage: FILE_PATH, NET_ENDPOINT, GRPC_ENDPOINT, AWS_*, EXTRA_HEADERS, PROMETHEUS_BIND, QUEUE_CAPACITY, WAL_RETRY_INTERVAL_MS, `TPT_LOG_CONFIG`
+- [x] Surface `tpt-log.toml` parse errors instead of silently defaulting; warn on unknown keys (`deny_unknown_fields`)
+- [x] Fix README sample config (`[endpoint]` table breaks parsing)
+- [x] Redact secrets in `Debug`/`Serialize` (`Secret<String>` for `api_key`, `aws_secret_key`)
+- [x] Only expand leading `~/` in `wal_dir` (currently corrupts Windows 8.3 paths)
+- [x] `host_and_process()` must return real hostname, not `service`; implement env-var enrichment
+- [x] Expand env-var coverage: FILE_PATH, NET_ENDPOINT, GRPC_ENDPOINT, AWS_*, EXTRA_HEADERS, PROMETHEUS_BIND, QUEUE_CAPACITY, WAL_RETRY_INTERVAL_MS, `TPT_LOG_CONFIG`
 
 ### Filtering
-- [ ] Metrics/traces bypass `min_level` and sampling
-- [ ] Per-level sampling map; never sample WARN and above
-- [ ] `is_enabled()` should account for regex/tag filters
+- [x] Metrics/traces bypass `min_level` and sampling
+- [x] Per-level sampling map; never sample WARN and above
+- [x] `is_enabled()` should account for regex/tag filters
 
 ### Bindings
-- [ ] FFI/C: fix `wal_enabled` tri-state (zero-init must mean default, not off)
-- [ ] Go: fix `WalEnabled:false` (currently sends "default" = on); add `WalDir`, `CompressionLevel`
-- [ ] Go: `sync.RWMutex` around handle (Close race) and `runtime.LockOSThread` around `lastError()`
-- [ ] FFI: add `tpt_log_log_json()` for nested metadata; wrap all entry points in `catch_unwind`
-- [ ] Python: release GIL (`allow_threads`) on blocking calls; never raise on NaN/Inf metadata
-- [ ] Python: `flush()`, context manager, `atexit` shutdown hook, `os.register_at_fork` handling
-- [ ] Expose `stats()` and `flush()` in every binding (Py/JS/Go/C)
+- [x] FFI/C: fix `wal_enabled` tri-state (zero-init must mean default, not off)
+- [x] Go: fix `WalEnabled:false` (currently sends "default" = on); add `WalDir`, `CompressionLevel`
+- [x] Go: `sync.RWMutex` around handle (Close race) and `runtime.LockOSThread` around `lastError()`
+- [x] FFI: add `tpt_log_log_json()` for nested metadata; wrap all entry points in `catch_unwind`
+- [x] Python: release GIL (`allow_threads`) on blocking calls; never raise on NaN/Inf metadata
+- [x] Python: `flush()`, context manager, `atexit` shutdown hook, `os.register_at_fork` handling
+- [x] Expose `stats()` and `flush()` in every binding (Py/JS/Go/C)
 
 ### Hot path performance
-- [ ] Remove 3x entry copy (processor clone -> Arc -> batch clone); make `process(&mut entry)`
-- [ ] Remove global `Mutex<usize>` from queue push/pop (and dead `buffered` counter)
-- [ ] Carry entries/raw JSON with `CompressedBatch` to avoid decompress -> parse -> re-serialize in every adapter
-- [ ] `approx_size` should account for real metadata value sizes
-- [ ] Re-run throughput benchmark; record RSS/CPU so README targets are measured
+- [x] Remove 3x entry copy (processor clone -> Arc -> batch clone); make `process(&mut entry)`
+- [x] Remove global `Mutex<usize>` from queue push/pop (and dead `buffered` counter)
+- [x] Carry entries/raw JSON with `CompressedBatch` to avoid decompress -> parse -> re-serialize in every adapter
+- [x] `approx_size` should account for real metadata value sizes
+- [x] Re-run throughput benchmark; record RSS/CPU so README targets are measured
 
 ### Regression tests
-- [ ] Backend down + `shutdown()` returns within timeout
-- [ ] 429 retried; 400 dead-lettered after N replays
-- [ ] Two instances with different services never cross-deliver WAL files
-- [ ] Queue full + `drop_newest` never blocks `info()`
-- [ ] `sample_rate`/`min_level` leave metrics and ERRORs intact
-- [ ] Python: NaN metadata, GIL release, fork; Go: `go test`; WASM: 4xx head-of-line case
+- [x] Backend down + `shutdown()` returns within timeout
+- [x] 429 retried; 400 dead-lettered after N replays
+- [x] Two instances with different services never cross-deliver WAL files
+- [x] Queue full + `drop_newest` never blocks `info()`
+- [x] `sample_rate`/`min_level` leave metrics and ERRORs intact
+- [x] Python: NaN metadata, GIL release, fork; Go: `go test`; WASM: 4xx head-of-line case
 
 ## Phase 10 — Adapter Correctness
 

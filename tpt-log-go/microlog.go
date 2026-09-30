@@ -45,40 +45,56 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
+	"sync"
 	"unsafe"
 )
 
 // Config mirrors the C tpt_log_config struct. Empty strings and zero numbers
 // mean "use the library default".
 type Config struct {
-	Backend       string  // "none", "http", "datadog", "elasticsearch", "cloudwatch", "prometheus", "grpc", "udp", "tcp", "file"
-	Endpoint      string  // base URL for HTTP-style backends
-	ApiKey        string  // secret token (Datadog DD-API-KEY, ...)
-	Service       string  // logical service name
-	BatchSize     int     // entries per batch (0 -> default 100)
-	FlushInterval float64 // flush interval seconds (0 -> default 1.0)
-	MaxRetries    int     // delivery attempts (0 -> default 10)
-	WalEnabled    bool    // disk write-ahead log on delivery failure
+	Backend          string  // "none", "http", "datadog", "elasticsearch", "cloudwatch", "prometheus", "grpc", "udp", "tcp", "file"
+	Endpoint         string  // base URL for HTTP-style backends
+	ApiKey           string  // secret token (Datadog DD-API-KEY, ...)
+	Service          string  // logical service name
+	BatchSize        int     // entries per batch (0 -> default 100)
+	FlushInterval    float64 // flush interval seconds (0 -> default 1.0)
+	CompressionLevel int     // zstd level (0 -> default 3)
+	MaxRetries       int     // delivery attempts (0 -> default 10)
+	// WalEnabled is explicit: false disables the disk write-ahead log, true
+	// enables it. (The zero value is indistinguishable from an unset field,
+	// so there is no tri-state here; the library default is enabled.)
+	WalEnabled bool
+	WalDir     string // WAL directory ("" -> platform default)
 }
 
 // MicroLog is a handle to a native tpt-microlog engine. Safe for concurrent
 // use by multiple goroutines.
 type MicroLog struct {
+	mu     sync.RWMutex
 	handle *C.tpt_log_handle
 }
 
 // New creates a logger. Callers must eventually call Close (or Shutdown then
 // Close) to flush and free the native engine.
 func New(cfg Config) (*MicroLog, error) {
+	// lastError() is thread-local in the native library: pin this goroutine
+	// to its OS thread so create + error read happen on the same thread.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	cCfg := C.tpt_log_config{}
 	cCfg.backend = cStringOpt(cfg.Backend)
 	cCfg.endpoint = cStringOpt(cfg.Endpoint)
 	cCfg.api_key = cStringOpt(cfg.ApiKey)
 	cCfg.service = cStringOpt(cfg.Service)
+	cCfg.wal_dir = cStringOpt(cfg.WalDir)
 	cCfg.batch_size = C.int32_t(cfg.BatchSize)
 	cCfg.flush_interval = C.double(cfg.FlushInterval)
+	cCfg.compression_level = C.int32_t(cfg.CompressionLevel)
 	cCfg.max_retries = C.int32_t(cfg.MaxRetries)
+	// 0 means "default" in the C ABI; false must mean OFF, not default.
 	if cfg.WalEnabled {
 		cCfg.wal_enabled = 1
 	} else {
@@ -90,6 +106,7 @@ func New(cfg Config) (*MicroLog, error) {
 	freeOpt(cCfg.endpoint)
 	freeOpt(cCfg.api_key)
 	freeOpt(cCfg.service)
+	freeOpt(cCfg.wal_dir)
 	if handle == nil {
 		return nil, errors.New(lastError())
 	}
@@ -109,6 +126,8 @@ func freeOpt(p *C.char) {
 	}
 }
 
+// lastError reads the native thread-local error buffer. Callers must pin the
+// OS thread (runtime.LockOSThread) around the failing call and this read.
 func lastError() string {
 	if msg := C.tpt_log_last_error(); msg != nil {
 		return C.GoString(msg)
@@ -134,7 +153,7 @@ func encodeMetadata(md map[string]any) (string, error) {
 }
 
 func (m *MicroLog) logAt(level C.int32_t, message string, md map[string]any) error {
-	if m == nil || m.handle == nil {
+	if m == nil {
 		return errors.New("microlog: logger is closed")
 	}
 	meta, err := encodeMetadata(md)
@@ -148,6 +167,17 @@ func (m *MicroLog) logAt(level C.int32_t, message string, md map[string]any) err
 		cMeta = C.CString(meta)
 		defer C.free(unsafe.Pointer(cMeta))
 	}
+
+	// Lock the OS thread so a failure's thread-local error message is read
+	// from the same thread that produced it; hold the handle lock read-only
+	// so Close cannot free the handle mid-call.
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return errors.New("microlog: logger is closed")
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	if code := C.tpt_log_log(m.handle, level, cMsg, cMeta); code != C.TPT_LOG_OK {
 		return fmt.Errorf("microlog: log failed (code %d): %s", code, lastError())
 	}
@@ -186,7 +216,7 @@ func (m *MicroLog) Fatal(message string, md map[string]any) error {
 
 // Metric records a numeric gauge/counter with optional tags.
 func (m *MicroLog) Metric(name string, value float64, tags map[string]string) error {
-	if m == nil || m.handle == nil {
+	if m == nil {
 		return errors.New("microlog: logger is closed")
 	}
 	md := make(map[string]any, len(tags))
@@ -204,6 +234,14 @@ func (m *MicroLog) Metric(name string, value float64, tags map[string]string) er
 		cMeta = C.CString(meta)
 		defer C.free(unsafe.Pointer(cMeta))
 	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return errors.New("microlog: logger is closed")
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	if code := C.tpt_log_metric(m.handle, cName, C.double(value), cMeta); code != C.TPT_LOG_OK {
 		return fmt.Errorf("microlog: metric failed (code %d): %s", code, lastError())
 	}
@@ -212,15 +250,78 @@ func (m *MicroLog) Metric(name string, value float64, tags map[string]string) er
 
 // Queued reports how many entries are still buffered in the ingestion queue.
 func (m *MicroLog) Queued() int {
-	if m == nil || m.handle == nil {
+	if m == nil {
+		return 0
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
 		return 0
 	}
 	return int(C.tpt_log_queued(m.handle))
 }
 
+// Flush pushes buffered entries into the delivery pipeline immediately and
+// waits (bounded by the engine's shutdown timeout) until everything is
+// delivered or persisted to the WAL.
+func (m *MicroLog) Flush() error {
+	if m == nil {
+		return errors.New("microlog: logger is closed")
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return errors.New("microlog: logger is closed")
+	}
+	if code := C.tpt_log_flush(m.handle); code != C.TPT_LOG_OK {
+		return fmt.Errorf("microlog: flush failed (code %d)", code)
+	}
+	return nil
+}
+
+// Stats is a snapshot of delivery counters.
+type Stats struct {
+	DeliveredBatches uint64 `json:"delivered_batches"`
+	DeliveredEntries uint64 `json:"delivered_entries"`
+	WalWrites        uint64 `json:"wal_writes"`
+	RetriedEntries   uint64 `json:"retried_entries"`
+	DroppedBatches   uint64 `json:"dropped_batches"`
+	DroppedEntries   uint64 `json:"dropped_entries"`
+	Queued           uint64 `json:"queued"`
+	Inflight         uint64 `json:"inflight"`
+}
+
+// Stats returns a snapshot of delivery counters.
+func (m *MicroLog) Stats() (Stats, error) {
+	var out Stats
+	if m == nil {
+		return out, errors.New("microlog: logger is closed")
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return out, errors.New("microlog: logger is closed")
+	}
+	buf := make([]C.char, 512)
+	n := C.tpt_log_stats_json(m.handle, &buf[0], C.size_t(len(buf)))
+	if n < 0 {
+		return out, fmt.Errorf("microlog: stats failed (code %d)", n)
+	}
+	payload := C.GoStringN(&buf[0], C.int(n-1))
+	if err := json.Unmarshal([]byte(payload), &out); err != nil {
+		return out, fmt.Errorf("microlog: stats decode: %w", err)
+	}
+	return out, nil
+}
+
 // Shutdown flushes pending batches and drains the write-ahead log. Idempotent.
 func (m *MicroLog) Shutdown() error {
-	if m == nil || m.handle == nil {
+	if m == nil {
+		return errors.New("microlog: logger is closed")
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
 		return errors.New("microlog: logger is closed")
 	}
 	if code := C.tpt_log_shutdown(m.handle); code != C.TPT_LOG_OK {
@@ -235,9 +336,14 @@ func Version() string {
 }
 
 // Close shuts the engine down (if needed) and frees the native handle. It is
-// safe to call more than once.
+// safe to call more than once and races safely with in-flight log calls.
 func (m *MicroLog) Close() error {
-	if m == nil || m.handle == nil {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.handle == nil {
 		return nil
 	}
 	_ = C.tpt_log_shutdown(m.handle)

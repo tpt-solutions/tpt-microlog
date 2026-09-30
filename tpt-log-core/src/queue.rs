@@ -1,83 +1,92 @@
+use crate::config::QueueFullPolicy;
 use crate::LogEntry;
-use std::sync::{Arc, Mutex};
+
+/// Result of a [`LogQueue::push`] under the configured overflow policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PushOutcome {
+    /// Entry is buffered.
+    Accepted,
+    /// Entry was dropped (`drop_newest` with a full queue).
+    Dropped,
+    /// Entry is buffered, but the oldest queued entry was evicted to make
+    /// room (`drop_oldest`).
+    EvictedOldest,
+}
 
 /// Bounded multi-producer, single-consumer ingestion queue.
 ///
-/// Backed by a lock-free `crossbeam-channel`. Producers blocks when full —
-/// this provides flow control without ever dropping a log (spec §2.4).
+/// Backed by a lock-free `crossbeam-channel`. What happens when the queue is
+/// full is decided by [`QueueFullPolicy`] (spec §2.4):
+///
+/// - [`QueueFullPolicy::Block`] applies backpressure to the producer (never
+///   drops a log, but can stall the calling thread),
+/// - [`QueueFullPolicy::DropNewest`] drops the entry being pushed,
+/// - [`QueueFullPolicy::DropOldest`] evicts the oldest buffered entry to make
+///   room, keeping the freshest telemetry.
 pub struct LogQueue {
-    tx: crossbeam_channel::Sender<Arc<LogEntry>>,
-    rx: crossbeam_channel::Receiver<Arc<LogEntry>>,
+    tx: crossbeam_channel::Sender<LogEntry>,
+    rx: crossbeam_channel::Receiver<LogEntry>,
     capacity: usize,
-    /// Approximate bytes currently buffered (for memory-based batching).
-    buffered: Mutex<usize>,
+    policy: QueueFullPolicy,
 }
 
 impl LogQueue {
-    /// Create a bounded queue with the given capacity.
-    pub fn new(capacity: usize) -> Self {
+    /// Create a bounded queue with the given capacity and overflow policy.
+    pub fn new(capacity: usize, policy: QueueFullPolicy) -> Self {
         let (tx, rx) = crossbeam_channel::bounded(capacity.max(1));
         Self {
             tx,
             rx,
             capacity: capacity.max(1),
-            buffered: Mutex::new(0),
+            policy,
         }
     }
 
-    /// Push an entry, blocking while the queue is full (guaranteed delivery).
-    pub fn push(&self, entry: LogEntry) {
-        let len = entry.approx_size();
-        *self.buffered.lock().unwrap() += len;
-        // `send` blocks until space is available; never drops.
-        let _ = self.tx.send(Arc::new(entry));
+    /// Push an entry per the configured overflow policy.
+    pub fn push(&self, entry: LogEntry) -> PushOutcome {
+        match self.policy {
+            QueueFullPolicy::Block => {
+                // `send` blocks until space is available; never drops.
+                self.tx
+                    .send(entry)
+                    .map(|_| PushOutcome::Accepted)
+                    .unwrap_or(PushOutcome::Dropped)
+            }
+            QueueFullPolicy::DropNewest => match self.tx.try_send(entry) {
+                Ok(()) => PushOutcome::Accepted,
+                Err(crossbeam_channel::TrySendError::Full(_)) => PushOutcome::Dropped,
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => PushOutcome::Dropped,
+            },
+            QueueFullPolicy::DropOldest => match self.tx.try_send(entry) {
+                Ok(()) => PushOutcome::Accepted,
+                Err(crossbeam_channel::TrySendError::Full(entry)) => {
+                    // Evict the oldest entry, then retry once.
+                    match self.rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                        Ok(_) => match self.tx.try_send(entry) {
+                            Ok(()) => PushOutcome::EvictedOldest,
+                            _ => PushOutcome::Dropped,
+                        },
+                        Err(_) => PushOutcome::Dropped,
+                    }
+                }
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => PushOutcome::Dropped,
+            },
+        }
     }
 
-    /// Non-blocking push. Returns `false` if the queue is full.
+    /// Non-blocking push ignoring policy. Returns `false` if the queue is full.
     pub fn try_push(&self, entry: LogEntry) -> bool {
-        let len = entry.approx_size();
-        if self.tx.try_send(Arc::new(entry)).is_ok() {
-            *self.buffered.lock().unwrap() += len;
-            true
-        } else {
-            false
-        }
+        self.tx.try_send(entry).is_ok()
     }
 
     /// Blocking receive; `None` when the producer side is disconnected/closed.
-    pub fn pop(&self) -> Option<Arc<LogEntry>> {
-        match self.rx.recv() {
-            Ok(entry) => {
-                let len = entry.approx_size();
-                let mut buf = self.buffered.lock().unwrap();
-                *buf = buf.saturating_sub(len);
-                Some(entry)
-            }
-            Err(_) => None,
-        }
-    }
-
-    /// Non-blocking receive of as many entries as currently available.
-    pub fn drain_available(&self) -> Vec<Arc<LogEntry>> {
-        let mut out = Vec::new();
-        while let Ok(entry) = self.rx.try_recv() {
-            let len = entry.approx_size();
-            let mut buf = self.buffered.lock().unwrap();
-            *buf = buf.saturating_sub(len);
-            drop(buf);
-            out.push(entry);
-        }
-        out
+    pub fn pop(&self) -> Option<LogEntry> {
+        self.rx.recv().ok()
     }
 
     /// Receiver side of the channel (for select loops in the batcher).
-    pub(crate) fn receiver(&self) -> crossbeam_channel::Receiver<Arc<LogEntry>> {
+    pub(crate) fn receiver(&self) -> crossbeam_channel::Receiver<LogEntry> {
         self.rx.clone()
-    }
-
-    /// Approximate bytes still buffered in this queue.
-    pub fn buffered_bytes(&self) -> usize {
-        *self.buffered.lock().unwrap()
     }
 
     /// Queue capacity.
@@ -103,33 +112,64 @@ mod tests {
 
     #[test]
     fn push_and_pop() {
-        let q = LogQueue::new(10);
-        q.push(LogEntry::new(LogLevel::Info, "a"));
-        q.push(LogEntry::new(LogLevel::Info, "b"));
+        let q = LogQueue::new(10, QueueFullPolicy::Block);
+        assert_eq!(
+            q.push(LogEntry::new(LogLevel::Info, "a")),
+            PushOutcome::Accepted
+        );
+        assert_eq!(
+            q.push(LogEntry::new(LogLevel::Info, "b")),
+            PushOutcome::Accepted
+        );
         assert_eq!(q.len(), 2);
         let a = q.pop().unwrap();
         assert_eq!(a.message, "a");
         assert_eq!(q.len(), 1);
-        assert!(q.buffered_bytes() > 0);
-    }
-
-    #[test]
-    fn drain_available() {
-        let q = LogQueue::new(10);
-        for i in 0..5 {
-            q.push(LogEntry::new(LogLevel::Debug, format!("e{i}")));
-        }
-        let drained = q.drain_available();
-        assert_eq!(drained.len(), 5);
-        assert!(q.is_empty());
     }
 
     #[test]
     fn bounded_backpressure() {
-        let q = LogQueue::new(2);
-        // Use try_push so we don't block; queue of 2 should reject the 3rd.
+        let q = LogQueue::new(2, QueueFullPolicy::Block);
         assert!(q.try_push(LogEntry::new(LogLevel::Info, "1")));
         assert!(q.try_push(LogEntry::new(LogLevel::Info, "2")));
         assert!(!q.try_push(LogEntry::new(LogLevel::Info, "3")));
+    }
+
+    #[test]
+    fn drop_newest_rejects_when_full() {
+        let q = LogQueue::new(2, QueueFullPolicy::DropNewest);
+        assert_eq!(
+            q.push(LogEntry::new(LogLevel::Info, "1")),
+            PushOutcome::Accepted
+        );
+        assert_eq!(
+            q.push(LogEntry::new(LogLevel::Info, "2")),
+            PushOutcome::Accepted
+        );
+        assert_eq!(
+            q.push(LogEntry::new(LogLevel::Info, "3")),
+            PushOutcome::Dropped
+        );
+        assert_eq!(q.pop().unwrap().message, "1");
+    }
+
+    #[test]
+    fn drop_oldest_keeps_newest() {
+        let q = LogQueue::new(2, QueueFullPolicy::DropOldest);
+        assert_eq!(
+            q.push(LogEntry::new(LogLevel::Info, "1")),
+            PushOutcome::Accepted
+        );
+        assert_eq!(
+            q.push(LogEntry::new(LogLevel::Info, "2")),
+            PushOutcome::Accepted
+        );
+        assert_eq!(
+            q.push(LogEntry::new(LogLevel::Info, "3")),
+            PushOutcome::EvictedOldest
+        );
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.pop().unwrap().message, "2");
+        assert_eq!(q.pop().unwrap().message, "3");
     }
 }
