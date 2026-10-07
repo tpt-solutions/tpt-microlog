@@ -6,6 +6,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
@@ -22,23 +26,50 @@ jobs:
           arguments: --all-features
 
   test:
-    name: cargo test
-    runs-on: ubuntu-latest
+    name: cargo test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-          - target: x86_64-pc-windows-gnu
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - name: Build workspace
         run: cargo build --workspace --exclude tpt-log-py
       - name: Run tests
         run: cargo test --workspace --exclude tpt-log-py
+      - name: Run core tests with the tracing / log integrations
+        run: cargo test -p tpt-log-core --all-features
+
+  cross-windows-gnu:
+    name: cross-build (x86_64-pc-windows-gnu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - name: Install mingw-w64
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+      - uses: Swatinem/rust-cache@v2
+      - name: Cross-build (artifacts the Go binding links against)
+        run: >
+          cargo build --workspace --exclude tpt-log-py --exclude tpt-log-wasm
+          --target x86_64-pc-windows-gnu
+
+  msrv:
+    name: MSRV (1.89)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Keep in sync with `rust-version` in the workspace Cargo.toml
+      # (1.89 is when `File::try_lock`, used by the WAL, was stabilized).
+      - uses: dtolnay/rust-toolchain@1.89
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --exclude tpt-log-py --exclude tpt-log-wasm --locked
+      - run: cargo check -p tpt-log-core --all-features --locked
 
   clippy:
     name: cargo clippy
@@ -50,6 +81,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --exclude tpt-log-py --all-targets -- -D warnings
+      - run: cargo clippy -p tpt-log-core --all-targets --all-features -- -D warnings
 
   fmt:
     name: cargo fmt
@@ -61,8 +93,65 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  python:
+    name: python smoke (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, python: "3.9" }
+          - { os: ubuntu-latest, python: "3.13" }
+          - { os: macos-latest, python: "3.12" }
+          - { os: windows-latest, python: "3.12" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the wheel and install it (tests the real artifact)
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip maturin pytest
+          maturin build --release --manifest-path tpt-log-py/Cargo.toml --out dist
+          python -m pip install --no-index --find-links dist tpt-microlog
+      - name: pytest
+        shell: bash
+        working-directory: tpt-log-py
+        run: python -m pytest tests -q
+      - name: Recipes (each asserts its own result)
+        shell: bash
+        run: |
+          for recipe in examples/recipes/*.py; do
+            echo "== $recipe"
+            python "$recipe"
+          done
+
+  go:
+    name: go smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tpt-log-go/go.mod
+      - run: cargo build --release -p tpt-log-ffi
+      - name: go vet + go test (links the static library)
+        working-directory: tpt-log-go
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          export CGO_CFLAGS="-I$GITHUB_WORKSPACE/tpt-log-ffi/include"
+          export CGO_LDFLAGS="-L$GITHUB_WORKSPACE/target/release -Wl,-Bstatic -ltpt_log_ffi -Wl,-Bdynamic -lm -ldl -lpthread"
+          go vet ./...
+          go test -count=1 ./...
+
   wasm:
-    name: wasm build
+    name: wasm build + node smoke
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -70,10 +159,77 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+      - name: wasm-bindgen version (the CLI must match Cargo.lock exactly)
+        id: wb
+        run: |
+          v=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p')
+          echo "version=$v" >> "$GITHUB_OUTPUT"
       - run: cargo build -p tpt-log-wasm --target wasm32-unknown-unknown
       - uses: jetli/wasm-bindgen-action@v0.2.0
         with:
-          version: "0.2.100"
-      - run: |
-          mkdir -p dist
-          wasm-bindgen --no-typescript --target web --out-dir dist target/wasm32-unknown-unknown/debug/tpt_log_wasm.wasm
+          version: ${{ steps.wb.outputs.version }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Generate the Node glue and run the smoke test
+        run: |
+          wasm-bindgen --no-typescript --target nodejs --out-dir wasm-node \
+            target/wasm32-unknown-unknown/debug/tpt_log_wasm.wasm
+          node tpt-log-wasm/tests/smoke.mjs wasm-node/tpt_log_wasm.js
+      - name: Web-target glue + pino bridge (against the real pino package)
+        run: |
+          wasm-bindgen --no-typescript --target web --out-dir tpt-log-wasm/dist \
+            target/wasm32-unknown-unknown/debug/tpt_log_wasm.wasm
+          cd tpt-log-wasm
+          npm install --no-save --no-package-lock pino@9
+          node tests/pino.mjs
+          # The tarball must ship the pino bridge.
+          npm pack --dry-run 2>&1 | tee pack.txt
+          grep -q "pino.js" pack.txt
+
+  bench:
+    name: throughput regression (>20% fails)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: head
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            head
+            base
+      - name: Run the same benchmark on base and head (same machine)
+        env:
+          RUSTFLAGS: ""
+        run: |
+          # The base commit may predate the benchmark: run head's copy of it.
+          mkdir -p base/tpt-log-core/examples
+          cp head/tpt-log-core/examples/ci_bench.rs base/tpt-log-core/examples/ci_bench.rs
+          (cd base && cargo build --release -q -p tpt-log-core --example ci_bench)
+          (cd head && cargo build --release -q -p tpt-log-core --example ci_bench)
+          # Interleave runs to damp noisy-neighbour effects; keep the best.
+          best_base=0; best_head=0
+          for i in 1 2 3; do
+            b=$(cd base && cargo run --release -q -p tpt-log-core --example ci_bench | sed 's/entries_per_sec=//')
+            h=$(cd head && cargo run --release -q -p tpt-log-core --example ci_bench | sed 's/entries_per_sec=//')
+            echo "round $i: base=$b head=$h"
+            [ "$b" -gt "$best_base" ] && best_base=$b
+            [ "$h" -gt "$best_head" ] && best_head=$h
+          done
+          echo "best base=$best_base head=$best_head"
+          python3 - "$best_base" "$best_head" <<'PY'
+          import sys
+          base, head = float(sys.argv[1]), float(sys.argv[2])
+          ratio = head / base
+          print(f"head/base throughput ratio: {ratio:.2f}")
+          if ratio < 0.8:
+              print("::error::throughput regressed by more than 20%")
+              sys.exit(1)
+          PY

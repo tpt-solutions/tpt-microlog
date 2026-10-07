@@ -17,19 +17,19 @@ use crate::gen::{
     ExportLogsServiceRequest, LogRecord, LogsServiceClient, ResourceLogs, ScopeLogs, SeverityNumber,
 };
 
-// Thread-local current-thread runtime so blocking `send` calls can drive the
-// tonic client without paying runtime construction per attempt.
-thread_local! {
-    static RT: tokio::runtime::Runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build tokio runtime");
-}
-
 /// OTLP logs gRPC transport.
+///
+/// Owns a small dedicated tokio runtime. tonic's channel spawns a background
+/// worker task onto the runtime that is current when the channel is built, so
+/// the channel must live on a runtime that keeps running independently of the
+/// caller: the logger builds the transport on one thread and sends from its
+/// delivery thread.
 pub struct GrpcTransport {
     channel: Channel,
     service: String,
+    /// `Option` so `Drop` can release it without blocking (dropping a runtime
+    /// from inside another async context would otherwise panic).
+    rt: Option<tokio::runtime::Runtime>,
 }
 
 impl std::fmt::Debug for GrpcTransport {
@@ -40,35 +40,90 @@ impl std::fmt::Debug for GrpcTransport {
     }
 }
 
-impl GrpcTransport {
-    /// Connect to an OTLP gRPC endpoint asynchronously.
-    pub async fn connect(endpoint: &str) -> Result<Self, TransportError> {
-        let uri = canonical_uri(endpoint);
-        let channel = tonic::transport::Endpoint::from_shared(uri)
+impl Drop for GrpcTransport {
+    fn drop(&mut self) {
+        if let Some(rt) = self.rt.take() {
+            rt.shutdown_background();
+        }
+    }
+}
+
+fn new_runtime() -> Result<tokio::runtime::Runtime, TransportError> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("tpt-microlog-grpc")
+        .enable_all()
+        .build()
+        .map_err(|e| TransportError::Config(format!("cannot start gRPC runtime: {e}")))
+}
+
+fn endpoint_for(endpoint: &str) -> Result<tonic::transport::Endpoint, TransportError> {
+    Ok(
+        tonic::transport::Endpoint::from_shared(canonical_uri(endpoint))
             .map_err(|e| TransportError::Config(format!("invalid gRPC endpoint: {e}")))?
             .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(15))
-            .connect()
+            .timeout(Duration::from_secs(15)),
+    )
+}
+
+impl GrpcTransport {
+    /// Connect to an OTLP gRPC endpoint, failing if it is unreachable now.
+    pub async fn connect(endpoint: &str) -> Result<Self, TransportError> {
+        let target = endpoint_for(endpoint)?;
+        let rt = new_runtime()?;
+        // Connect on the transport's own runtime so the channel worker lives
+        // there; only the result is awaited on the caller's runtime.
+        let channel = rt
+            .spawn(async move { target.connect().await })
             .await
+            .map_err(|e| TransportError::Transient(format!("gRPC connect task failed: {e}")))?
             .map_err(|e| TransportError::Transient(format!("gRPC connect failed: {e}")))?;
         Ok(Self {
             channel,
             service: endpoint.to_string(),
+            rt: Some(rt),
         })
     }
 
-    /// Connect from a blocking context (no async runtime on the caller).
+    /// Connect from a blocking context, failing if the endpoint is unreachable.
     pub fn blocking_connect(endpoint: &str) -> Result<Self, TransportError> {
-        RT.with(|rt| rt.block_on(Self::connect(endpoint)))
+        let target = endpoint_for(endpoint)?;
+        let rt = new_runtime()?;
+        let channel = rt
+            .block_on(async move { target.connect().await })
+            .map_err(|e| TransportError::Transient(format!("gRPC connect failed: {e}")))?;
+        Ok(Self {
+            channel,
+            service: endpoint.to_string(),
+            rt: Some(rt),
+        })
     }
 
-    /// Build from core config (`grpc_endpoint`).
+    /// Build a transport that connects on first use and reconnects on demand.
+    /// Never touches the network, so an application can start before its
+    /// collector; failures surface as retryable errors from `send`, which the
+    /// engine retries and falls back to the WAL for.
+    pub fn lazy(endpoint: &str) -> Result<Self, TransportError> {
+        let target = endpoint_for(endpoint)?;
+        let rt = new_runtime()?;
+        let channel = {
+            let _guard = rt.enter();
+            target.connect_lazy()
+        };
+        Ok(Self {
+            channel,
+            service: endpoint.to_string(),
+            rt: Some(rt),
+        })
+    }
+
+    /// Build from core config (`grpc_endpoint`); connects lazily.
     pub fn from_config(config: &Config) -> Result<Self, TransportError> {
         let endpoint = config
             .grpc_endpoint
             .clone()
             .ok_or_else(|| TransportError::Config("gRPC backend needs `grpc_endpoint`".into()))?;
-        Self::blocking_connect(&endpoint)
+        Self::lazy(&endpoint)
     }
 }
 
@@ -172,13 +227,15 @@ impl Transport for GrpcTransport {
         }
         let request = build_request(&self.service, &entries);
         let mut client = LogsServiceClient::new(self.channel.clone());
-        RT.with(|rt| {
-            rt.block_on(async {
-                match client.export(request).await {
-                    Ok(_) => Ok(()),
-                    Err(status) => Err(classify(status)),
-                }
-            })
+        let rt = self
+            .rt
+            .as_ref()
+            .ok_or_else(|| TransportError::Transient("gRPC transport is shut down".into()))?;
+        rt.block_on(async {
+            match client.export(request).await {
+                Ok(_) => Ok(()),
+                Err(status) => Err(classify(status)),
+            }
         })
     }
 

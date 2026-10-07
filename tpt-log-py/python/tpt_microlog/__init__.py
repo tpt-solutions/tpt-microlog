@@ -17,9 +17,9 @@ import os
 import weakref
 
 from tpt_microlog._native import MicroLog as _NativeMicroLog
-from tpt_microlog._native import load_config
+from tpt_microlog._native import load_config, set_on_error
 
-__all__ = ["MicroLog", "load_config"]
+__all__ = ["MicroLog", "load_config", "set_on_error"]
 __version__ = "0.1.0"
 
 # Live loggers (weakly held) so they can be flushed on interpreter exit and

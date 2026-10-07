@@ -1,5 +1,8 @@
 # tpt-microlog
 
+[![CI](https://github.com/tpt-solutions/tpt-microlog/actions/workflows/ci.yml/badge.svg)](https://github.com/tpt-solutions/tpt-microlog/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
 **The microscopic telemetry & log router. Reliable delivery, zero infrastructure.**
 
 `tpt-microlog` is an ultra-lightweight, embeddable logging and metrics engine written in pure Rust with bindings for **Python, JavaScript/WASM, Go, C/C++, and Rust**. It batches, compresses (zstd), and retries log delivery until your logs actually arrive — no sidecar collector, no heavy SDK.
@@ -28,8 +31,11 @@ log.shutdown()  # flush + drain before exit
 - **Background batching** — flush by time (1 s), size (100 entries), or memory (10 MB), whichever comes first.
 - **zstd compression** (level 3) shrinks network bandwidth and WAL disk I/O; disable with `fast_mode` for extreme throughput.
 - **At-least-once delivery** — failed batches are persisted to a size-capped WAL (default 100 MB, FIFO drop-oldest) and replayed until the backend accepts them; on graceful shutdown everything accepted is delivered or spilled to the WAL, and `durability = "wal-first"` extends the guarantee across hard crashes.
-- **Multi-backend** — Datadog, Elasticsearch, CloudWatch (SigV4), Prometheus (embedded `/metrics`), generic HTTP, gRPC (OTLP logs), UDP, TCP, and local JSONL files with rotation.
+- **Multi-backend** — Datadog, Elasticsearch, CloudWatch (SigV4), Grafana Loki, Splunk HEC, Prometheus (embedded `/metrics`), OTLP over gRPC or HTTP, generic HTTP, UDP, TCP, console, and local JSONL files with rotation; route to several at once with `fanout` or ordered `failover`.
 - **Structured + enriched** — arbitrary key/value metadata; optional hostname/PID/service enrichment; level filtering and sampling.
+- **Privacy built in** — `redact_keys`, custom `redact_patterns` and built-in detectors (email, card, SSN, JWT, ...) mask data before it reaches the WAL or the network.
+- **Never silent** — internal failures (delivery, WAL, worker panics, config) go to an `on_error` callback or stderr instead of vanishing.
+- **Fits your stack** — Python `logging.Handler`, Go `slog.Handler`, Rust `tracing` layer / `log` backend / panic hook, pino transport, plus a `tpt-microlog` CLI (`init`, `doctor`, `wal`, `tail`, `send-test`).
 - **Zero configuration** — reads `tpt-log.toml`, then `TPT_LOG_*` environment variables, then your code's overrides.
 
 ## Installation
@@ -145,7 +151,7 @@ Configuration is layered: code overrides > `TPT_LOG_*` environment variables > `
 
 ```toml
 # tpt-log.toml
-backend = "datadog"          # none|http|datadog|elasticsearch|cloudwatch|prometheus|grpc|udp|tcp|file
+backend = "datadog"          # none|console|http|datadog|elasticsearch|cloudwatch|loki|splunk|otlp-http|grpc|prometheus|udp|tcp|file|fanout
 service = "checkout-api"
 endpoint = "https://logs.example.com/v1"
 batch_size = 100             # entries per batch
@@ -160,6 +166,8 @@ wal_enabled = true
 wal_max_size_bytes = 104857600
 ```
 
+More ready-made configurations live in the [`tpt-log.toml` gallery](docs/toml-gallery.md), and a [JSON Schema](tpt-log-core/tpt-log.schema.json) gives editors completion and validation.
+
 Key environment variables: `TPT_LOG_CONFIG` (explicit config file path), `TPT_LOG_BACKEND`, `TPT_LOG_ENDPOINT`, `TPT_LOG_API_KEY`, `TPT_LOG_SERVICE`, `TPT_LOG_BATCH_SIZE`, `TPT_LOG_FLUSH_INTERVAL_MS`, `TPT_LOG_QUEUE_CAPACITY`, `TPT_LOG_QUEUE_FULL_POLICY`, `TPT_LOG_DURABILITY`, `TPT_LOG_SHUTDOWN_TIMEOUT_MS`, `TPT_LOG_WAL_ENABLED`, `TPT_LOG_WAL_DIR`, `TPT_LOG_WAL_RETRY_INTERVAL_MS`, `TPT_LOG_MIN_LEVEL`, `TPT_LOG_SAMPLE_RATE`, `TPT_LOG_ENRICHMENT`, `TPT_LOG_ENRICH_ENV_VARS`, `TPT_LOG_FAST_MODE`, `TPT_LOG_FILE_PATH`, `TPT_LOG_NET_ENDPOINT`, `TPT_LOG_GRPC_ENDPOINT`, `TPT_LOG_EXTRA_HEADERS`, `TPT_LOG_PROMETHEUS_BIND`, `TPT_LOG_AWS_REGION`, `TPT_LOG_AWS_ACCESS_KEY`, `TPT_LOG_AWS_SECRET_KEY`, `TPT_LOG_AWS_LOG_GROUP`, `TPT_LOG_AWS_LOG_STREAM`.
 
 Config files are discovered in this order: `$TPT_LOG_CONFIG`, then `./tpt-log.toml`, then `~/.config/tpt-microlog/tpt-log.toml` (`%APPDATA%\tpt-microlog` on Windows), then `/etc/tpt-microlog/tpt-log.toml`. Parse errors and unknown keys are reported on stderr — a typo can never silently disable a feature. Secret values (`api_key`, `aws_secret_key`) are redacted in `Debug`/serde output.
@@ -172,6 +180,14 @@ The WAL lives at `%APPDATA%\tpt-microlog\wal\` (Windows) or `~/.local/share/tpt-
 - **At-least-once across crashes with `durability = "wal-first"`**: each batch is written to the WAL *before* the first delivery attempt.
 - **Best-effort during operation with the default `durability = "best-effort"`**: a hard process kill can lose the in-memory buffer between WAL writes (use `wal-first` if that matters to you).
 - `queue_full_policy = "block"` never drops (at the cost of backpressure); `drop_newest`/`drop_oldest` trade drops for latency, counted in `dropped_entries`.
+
+What "at-least-once" does and does not cover:
+
+- **Duplicates are possible.** A batch that was accepted by the backend but whose acknowledgement was lost is sent again. Backends that de-duplicate (or idempotent queries) make this harmless; others will show a repeat.
+- **Some data is dropped on purpose**: entries removed by `min_level`, `sample_rate*`, `filter_*` and the `drop_*` queue policies never enter the pipeline.
+- **The WAL is bounded.** When it exceeds `wal_max_size_bytes` the oldest batches are discarded, and a batch that fails `wal_dead_letter_replays` replays is parked in `wal/dead/` rather than retried forever. Both are visible through `stats()` / the CLI and reported through `on_error`.
+- **Delivery order is not guaranteed** across a retry or WAL replay; entries carry their own timestamps.
+- In Python, a **forked child** process detaches (its logger becomes a no-op) rather than share the parent's worker threads.
 
 ## Performance
 
@@ -196,13 +212,15 @@ Remaining resource targets (validated by design and covered by tests, not yet tr
 | Path | Purpose |
 | --- | --- |
 | [`tpt-log-core/`](tpt-log-core/) | Pure Rust engine: lock-free queue, batching, zstd, WAL, retry, filtering/sampling/enrichment |
-| [`tpt-log-transport/`](tpt-log-transport/) | HTTP, Datadog/Elasticsearch/CloudWatch/Prometheus adapters, gRPC (OTLP), UDP, TCP, rotating JSONL file |
+| [`tpt-log-transport/`](tpt-log-transport/) | Datadog / Elasticsearch / CloudWatch / Loki / Splunk / Prometheus adapters, OTLP (gRPC + HTTP), generic HTTP, UDP, TCP, console, rotating JSONL file, fan-out routing, and the `Builder` |
 | [`tpt-log-ffi/`](tpt-log-ffi/) | C ABI boundary (`include/tpt_microlog.h`) for C/C++/Go consumers |
 | [`tpt-log-py/`](tpt-log-py/) | PyO3 wrapper shipped to PyPI as `tpt-microlog` (maturin, abi3 3.9+) |
 | [`tpt-log-wasm/`](tpt-log-wasm/) | Self-contained wasm-bindgen wrapper shipped to npm as `tpt-microlog` |
-| [`tpt-log-go/`](tpt-log-go/) | cgo wrapper module (`github.com/tpt-solutions/tpt-microlog-go`) |
-| `examples/` | Runnable examples for Python, JavaScript/Node, Go, and C |
-| `.github/workflows/` | CI (deny/clippy/test/fmt/wasm) and PyPI/npm publish pipelines |
+| [`tpt-log-go/`](tpt-log-go/) | cgo wrapper module (`github.com/tpt-solutions/tpt-microlog-go`) with a `slog` handler |
+| [`tpt-log-cli/`](tpt-log-cli/) | The `tpt-microlog` command line: `init`, `doctor`, `wal`, `tail`, `send-test` |
+| [`examples/`](examples/) | Runnable examples, [recipes](examples/recipes/) and [observability stacks](examples/stacks/) |
+| [`docs/`](docs/) | [`tpt-log.toml` gallery](docs/toml-gallery.md) |
+| `.github/workflows/` | CI (OS matrix, MSRV, clippy, fmt, cargo-deny, Python/Go/WASM smoke tests, benchmark regression) and PyPI/npm publish pipelines |
 
 ### Per-crate documentation
 
@@ -219,6 +237,10 @@ Each package carries its own README and CHANGELOG:
 
 Release notes that affect several crates are summarized in the section above;
 consult the individual changelogs for crate-specific detail.
+
+## Contributing and security
+
+The project takes contributions **through issues only**; pull requests are not accepted. See [CONTRIBUTING.md](CONTRIBUTING.md). Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md). Participation is governed by the [code of conduct](CODE_OF_CONDUCT.md). Release notes are in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

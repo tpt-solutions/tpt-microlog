@@ -172,39 +172,41 @@
 ## Phase 11 — Adoption & Usability
 
 ### Onboarding
-- [ ] `console`/`stdout` backend (pretty on TTY, JSON lines when piped); make it the default with a startup banner
-- [ ] Named presets (`dev`, `prod`, `datadog-eu`, `elastic-cloud`, `grafana-loki`, `otel-collector`, `cloudwatch-lambda`) with actionable validation errors
-- [ ] `tpt-microlog` CLI: `init`, `doctor` (config/DNS/TLS/auth/WAL checks), `wal ls|replay|purge|dead`, `tail`, `send-test`
-- [ ] Config search paths (`./`, `~/.config/tpt-microlog/`, `/etc/`) + `TPT_LOG_CONFIG`
-- [ ] JSON Schema for `tpt-log.toml`; "did you mean...?" hints for unknown keys; complete `.pyi`
-- [ ] `on_error` callback / internal diagnostics channel so failures are never silent
+- [x] `console`/`stdout` backend (pretty on TTY, JSON lines when piped); make it the default with a startup banner
+- [x] Named presets (`dev`, `prod`, `datadog-eu`, `elastic-cloud`, `grafana-loki`, `otel-collector`, `cloudwatch-lambda`) with actionable validation errors
+- [x] `tpt-microlog` CLI: `init`, `doctor` (config/DNS/TLS/auth/WAL checks), `wal ls|replay|purge|dead`, `tail`, `send-test`
+- [x] Config search paths (`./`, `~/.config/tpt-microlog/`, `/etc/`) + `TPT_LOG_CONFIG`
+- [x] JSON Schema for `tpt-log.toml`; "did you mean...?" hints for unknown keys; complete `.pyi`
+- [x] `on_error` callback / internal diagnostics channel so failures are never silent
 
 ### Integrations
-- [ ] Python `logging.Handler`
-- [ ] Go `slog.Handler`
-- [ ] Rust `tracing` Layer and `log` facade; panic hook; builder API; structured log macro
-- [ ] Node/pino or console transport
-- [ ] Multi-backend fan-out and failover routing
-- [ ] TLS/proxy config (`ca_cert`, `proxy`); OTLP/HTTP; Loki; Splunk HEC
+- [x] Python `logging.Handler`
+- [x] Go `slog.Handler`
+- [x] Rust `tracing` Layer and `log` facade; panic hook; builder API; structured log macro
+- [x] Node/pino or console transport
+- [x] Multi-backend fan-out and failover routing
+- [x] TLS/proxy config (`ca_cert`, `proxy`); OTLP/HTTP; Loki; Splunk HEC
 
 ### Examples & templates
-- [ ] `examples/stacks/`: ELK, Loki+Grafana, OTel Collector, Prometheus+Grafana (docker-compose + dashboards)
+- [x] `examples/stacks/`: ELK, Loki+Grafana, OTel Collector, Prometheus+Grafana (docker-compose + dashboards) — configs written; only the Prometheus app side verified, containers not started
 - [ ] `examples/frameworks/`: FastAPI, Flask, Django, Express, Next.js, Gin, net/http, Axum, AWS Lambda, Cloudflare Worker, CLI tool
-- [ ] `examples/recipes/`: request-id correlation, PII redaction, sampling noisy DEBUG, offline-first WAL demo, migration from logging/winston/zap
+- [x] `examples/recipes/`: request-id correlation, PII redaction, sampling noisy DEBUG, offline-first WAL demo, migration from `logging`
+- [ ] Recipes: migration from winston and zap
 - [ ] Starter templates per language (cookiecutter/degit), GitHub template repo, `.env.example`, Dockerfile + K8s ConfigMap/Helm snippets
-- [ ] `tpt-log.toml` gallery in `docs/`
+- [x] `tpt-log.toml` gallery in `docs/` (parsed and validated by a test)
 
 ### Distribution & docs
 - [ ] Go: prebuilt static libs (linux/mac/win x amd64/arm64) as release assets + fetcher; split module to resolve registry publishing
 - [ ] Publish `tpt-log-core` / `tpt-log-transport` to crates.io
 - [ ] Release automation (release-please/cargo-dist), changelog, Sigstore signing, SBOM
 - [ ] Docs site (mdBook/Docusaurus): quickstarts, backend cookbook, "delivery guarantees explained", troubleshooting, benchmark methodology
-- [ ] README: badges, 30-second demo GIF, corrected delivery-guarantee wording
-- [ ] `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, issue/PR templates, `CHANGELOG.md`
+- [x] README: badges, corrected delivery-guarantee wording
+- [ ] README: 30-second demo GIF; registry badges once the packages are published
+- [x] `CONTRIBUTING.md` (issues only), `SECURITY.md`, `CODE_OF_CONDUCT.md`, issue forms (no PR template: PRs are not accepted), `CHANGELOG.md`
 
 ## Phase 12 — Differentiators (pick 2-3)
 
-- [ ] PII/secret redaction (`redact` keys + regex + built-in detectors) applied before WAL and network
+- [x] PII/secret redaction (`redact` keys + regex + built-in detectors) applied before WAL and network
 - [ ] Adaptive sampling under pressure (always keep WARN+)
 - [ ] Burst dedup / rate limiting with `repeat_count`
 - [ ] Error-triggered "flight recorder" (ship buffered DEBUG context only on ERROR/FATAL)
@@ -218,9 +220,9 @@
 
 ## CI & Repo Hygiene
 
-- [ ] Real OS matrix (ubuntu/macos/windows); fix `--target` so the windows-gnu leg actually cross-builds
-- [ ] Add Python (`maturin develop` + `pytest`), Go (`go test`), and Node/WASM smoke-test jobs
-- [ ] MSRV job
-- [ ] Benchmark job that fails on >20% throughput regression
-- [ ] Dependabot/renovate
-- [ ] Verify `wasm-opt -Oz` actually runs in `publish-npm.yml`
+- [x] Real OS matrix (ubuntu/macos/windows); fix `--target` so the windows-gnu leg actually cross-builds
+- [x] Add Python (`maturin develop` + `pytest`), Go (`go test`), and Node/WASM smoke-test jobs
+- [x] MSRV job
+- [x] Benchmark job that fails on >20% throughput regression
+- [x] Dependabot/renovate
+- [x] Verify `wasm-opt -Oz` actually runs in `publish-npm.yml`

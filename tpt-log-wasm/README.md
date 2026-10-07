@@ -27,8 +27,13 @@ The package ships as an ES module with bundled TypeScript declarations.
 
 ### Browser
 
+The package is the `wasm-bindgen` *web* target: initialise the module once
+(`await init()`) before constructing a logger.
+
 ```js
-import { MicroLog } from 'tpt-microlog';
+import init, { MicroLog } from 'tpt-microlog';
+
+await init();
 
 const log = new MicroLog({
   backend: 'datadog',
@@ -47,8 +52,15 @@ window.addEventListener('pagehide', () => log.flush());
 
 ### Node.js
 
+In Node, initialise synchronously from the bundled `.wasm` file:
+
 ```js
-import { MicroLog } from 'tpt-microlog';
+import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { initSync, MicroLog } from 'tpt-microlog';
+
+const wasm = createRequire(import.meta.url).resolve('tpt-microlog/dist/tpt_log_wasm_bg.wasm');
+initSync({ module: readFileSync(wasm) });
 
 const log = new MicroLog({
   backend: 'custom',
@@ -60,6 +72,35 @@ const log = new MicroLog({
 log.info('server booted', { port: 8080 });
 await log.shutdown();
 ```
+
+### pino (Node.js)
+
+`tpt-microlog/pino` bridges [pino](https://getpino.io) to tpt-microlog and does
+the WASM initialisation itself. Each pino JSON line becomes one entry: `msg` is
+the message, `level` picks the severity, every other field is metadata.
+
+```js
+import pino from 'pino';
+import { createStream } from 'tpt-microlog/pino';
+
+// In-process destination
+const logger = pino(createStream({ endpoint: 'https://logs.example.com/v1', service: 'api' }));
+
+// ...or as a worker-thread transport (pino loads the default export)
+const logger2 = pino(
+  pino.transport({
+    target: 'tpt-microlog/pino',
+    options: { endpoint: 'https://logs.example.com/v1', redactKeys: ['password'] },
+  }),
+);
+
+logger.info({ orderId: 5 }, 'order placed');
+```
+
+`options` are the normal `MicroLog` options (including `redactKeys`,
+`redactBuiltin` and `onError`); pass `log` to reuse an existing instance.
+Ending the stream flushes and shuts the logger down. The entry timestamp is the
+time the line reaches the bridge; pino's own `time` field is kept as metadata.
 
 ## API
 

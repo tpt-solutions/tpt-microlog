@@ -386,6 +386,12 @@ pub struct Config {
     pub filter_tags: Vec<String>,
     /// Drop entries whose message matches this regex (spec §8).
     pub filter_regex: Option<String>,
+    /// Metadata keys (case-insensitive) whose values are always masked.
+    pub redact_keys: Vec<String>,
+    /// Regexes; matches in the message and string metadata are masked.
+    pub redact_patterns: Vec<String>,
+    /// Enable built-in detectors (email, card, SSN, JWT, bearer, AWS key).
+    pub redact_builtin: bool,
 
     /// Whether newline-delimited base64 framing is used for the WAL.
     pub wal_frame_newline: bool,
@@ -450,6 +456,9 @@ impl Default for Config {
             sample_rate_by_level: BTreeMap::new(),
             filter_tags: Vec::new(),
             filter_regex: None,
+            redact_keys: Vec::new(),
+            redact_patterns: Vec::new(),
+            redact_builtin: false,
             wal_frame_newline: true,
         }
     }
@@ -534,6 +543,9 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "sample_rate_by_level",
     "filter_tags",
     "filter_regex",
+    "redact_keys",
+    "redact_patterns",
+    "redact_builtin",
     "wal_frame_newline",
 ];
 
@@ -552,7 +564,10 @@ fn warn_unknown_keys(raw: &str) {
                 .min_by_key(|c| edit_distance(c, key))
                 .map(|c| format!(" (did you mean '{c}'?)"))
                 .unwrap_or_default();
-            eprintln!("tpt-microlog: ignoring unknown config key '{key}'{suggestion}");
+            crate::diag::report(
+                "config",
+                &format!("ignoring unknown config key '{key}'{suggestion}"),
+            );
         }
     }
 }
@@ -599,17 +614,17 @@ impl Config {
                 Ok(raw) => match Self::from_toml_str(&raw) {
                     Ok(cfg) => cfg,
                     Err(e) => {
-                        eprintln!(
-                            "tpt-microlog: ignoring invalid config file {}: {e}",
-                            path.display()
+                        crate::diag::report(
+                            "config",
+                            &format!("ignoring invalid config file {}: {e}", path.display()),
                         );
                         Self::default()
                     }
                 },
                 Err(e) => {
-                    eprintln!(
-                        "tpt-microlog: cannot read config file {}: {e}",
-                        path.display()
+                    crate::diag::report(
+                        "config",
+                        &format!("cannot read config file {}: {e}", path.display()),
                     );
                     Self::default()
                 }
@@ -634,7 +649,7 @@ impl Config {
         let mut cfg = toml::from_str::<Config>(raw)?;
         if let Some(preset) = cfg.preset.clone() {
             if let Err(e) = cfg.apply_preset(&preset) {
-                eprintln!("tpt-microlog: {e}");
+                crate::diag::report("config", &e);
             }
         }
         cfg.normalize();
@@ -726,6 +741,12 @@ impl Config {
         }
         if let Some(v) = env("TPT_LOG_FILTER_REGEX") {
             self.filter_regex = Some(v);
+        }
+        if let Some(v) = env("TPT_LOG_REDACT_KEYS") {
+            self.redact_keys = split_comma_list(&v);
+        }
+        if let Some(v) = env("TPT_LOG_REDACT_BUILTIN") {
+            self.redact_builtin = matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
         }
         if let Some(v) = env("TPT_LOG_FAST_MODE") {
             self.fast_mode = matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
@@ -924,8 +945,7 @@ impl Config {
             backend::CLOUDWATCH => {
                 if self.aws_region.is_none() {
                     problems.push(
-                        "cloudwatch backend needs `aws_region` (or the AWS_REGION env var)"
-                            .into(),
+                        "cloudwatch backend needs `aws_region` (or the AWS_REGION env var)".into(),
                     );
                 }
                 if self.resolved_aws_credentials().is_none() {
@@ -972,14 +992,12 @@ impl Config {
                     problems.push("file backend needs `file_path`".into());
                 }
             }
-            backend::FANOUT => {
-                if self.backends.is_empty() {
-                    problems.push(
-                        "fanout backend needs `backends = [\"datadog\", \"file\"]` — the \
-                         list of backend names to route to"
-                            .into(),
-                    );
-                }
+            backend::FANOUT if self.backends.is_empty() => {
+                problems.push(
+                    "fanout backend needs `backends = [\"datadog\", \"file\"]` — the \
+                     list of backend names to route to"
+                        .into(),
+                );
             }
             _ => {}
         }
@@ -1069,6 +1087,37 @@ fn home_dir_var() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shipped JSON Schema must describe exactly the keys the loader
+    /// accepts and every field `Config` serializes, so it cannot drift.
+    #[test]
+    fn json_schema_matches_config_keys() {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../tpt-log.schema.json")).unwrap();
+        let props: std::collections::BTreeSet<String> = schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        let known: std::collections::BTreeSet<String> =
+            KNOWN_CONFIG_KEYS.iter().map(|k| k.to_string()).collect();
+        assert_eq!(props, known, "schema vs KNOWN_CONFIG_KEYS");
+
+        let serialized = serde_json::to_value(Config::default()).unwrap();
+        for key in serialized.as_object().unwrap().keys() {
+            assert!(
+                props.contains(key),
+                "Config field `{key}` missing from schema"
+            );
+        }
+        let presets = schema["properties"]["preset"]["enum"].as_array().unwrap();
+        for name in presets {
+            Config::default()
+                .apply_preset(name.as_str().unwrap())
+                .unwrap_or_else(|e| panic!("schema lists unusable preset: {e}"));
+        }
+    }
 
     #[test]
     fn defaults_are_sane() {

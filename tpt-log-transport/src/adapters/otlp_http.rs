@@ -59,11 +59,8 @@ fn build_body(entries: &[LogEntry]) -> serde_json::Value {
     let records: Vec<serde_json::Value> = entries
         .iter()
         .map(|e| {
-            let mut attributes: Vec<serde_json::Value> = e
-                .metadata
-                .iter()
-                .map(|(k, v)| attr(k, v))
-                .collect();
+            let mut attributes: Vec<serde_json::Value> =
+                e.metadata.iter().map(|(k, v)| attr(k, v)).collect();
             attributes.push(attr("log.type", &serde_json::json!(e.log_type.to_string())));
             serde_json::json!({
                 "timeUnixNano": e.timestamp.to_string() + "000000",
@@ -105,10 +102,7 @@ impl OtlpHttpAdapter {
             }
         }
         if let Some(key) = &config.api_key {
-            headers.push((
-                "x-otlp-api-key".to_string(),
-                key.expose().to_string(),
-            ));
+            headers.push(("x-otlp-api-key".to_string(), key.expose().to_string()));
         }
         Ok(Self {
             client: client_from_config(config),
@@ -125,7 +119,13 @@ impl Transport for OtlpHttpAdapter {
             .map_err(|e| TransportError::Rejected(format!("decode failed: {e}")))?;
         let body = serde_json::to_vec(&build_body(&entries))
             .map_err(|e| TransportError::Rejected(format!("serialize failed: {e}")))?;
-        request_once(&self.client, &self.url, &self.headers, "application/json", body)
+        request_once(
+            &self.client,
+            &self.url,
+            &self.headers,
+            "application/json",
+            body,
+        )
     }
 
     fn name(&self) -> &str {

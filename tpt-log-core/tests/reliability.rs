@@ -134,6 +134,9 @@ fn rate_limited_is_retried_and_then_delivered() {
         }),
     );
     log.info("survives a 429");
+    // `flush()` waits for delivery including the retry; `shutdown()` alone
+    // deliberately abandons backoff and would race the 1 ms Retry-After.
+    assert!(log.flush(), "flush must wait for the retried delivery");
     log.shutdown();
     assert!(
         log.stats().delivered_entries.load(AtomicOrder::Relaxed) >= 1,
@@ -321,4 +324,57 @@ fn log_level_parse_roundtrip() {
     // Sanity for the min_level pipeline path.
     assert!("WARN".parse::<LogLevel>().is_ok());
     assert!("garbage".parse::<LogLevel>().is_err());
+}
+
+#[test]
+fn redaction_masks_data_before_it_reaches_the_transport() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = base_config(tmp.path());
+    cfg.wal_enabled = false;
+    cfg.redact_keys = vec!["token".into()];
+    cfg.redact_builtin = true;
+    let (log, spy) = MicroLog::with_spy(cfg);
+
+    log.log_with(
+        tpt_log_core::LogLevel::Info,
+        "signup by alice@example.com",
+        [("token", serde_json::json!("abc123"))],
+    );
+    log.shutdown();
+
+    let entries = spy.entries();
+    let e = entries
+        .iter()
+        .find(|e| e.message.starts_with("signup"))
+        .unwrap();
+    assert_eq!(e.message, "signup by [REDACTED]");
+    assert_eq!(e.metadata["token"], "[REDACTED]");
+}
+
+#[test]
+fn shutdown_releases_the_wal_lock_for_a_recreated_logger() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = base_config(tmp.path());
+    cfg.wal_enabled = true;
+    cfg.service = Some("relock".into());
+    let ns = tpt_log_core::wal::namespace(
+        cfg.service.as_deref(),
+        &cfg.backend,
+        cfg.endpoint.as_deref(),
+    );
+    let dir = tmp.path().join(ns);
+
+    let first = MicroLog::with_default_transport(cfg.clone());
+    first.info("one");
+    first.shutdown();
+    // `first` is still alive here (as in `log = make_logger()` reloads), yet
+    // the WAL directory must already be available to a new instance.
+    let reopened = tpt_log_core::Wal::open(&dir, 1_000_000);
+    assert!(
+        reopened.is_ok(),
+        "WAL lock still held after shutdown: {:?}",
+        reopened.err()
+    );
+    drop(reopened);
+    drop(first);
 }

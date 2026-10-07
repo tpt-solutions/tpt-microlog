@@ -1,0 +1,12 @@
+#:schema https://raw.githubusercontent.com/tpt-solutions/tpt-microlog/master/tpt-log-core/tpt-log.schema.json
+backend = "elasticsearch"
+endpoint = "http://localhost:9200"
+es_index = "tpt-microlog"
+service = "demo-app"
+enrichment = true
+batch_size = 20
+flush_interval_ms = 1000
+
+# Secured cluster? Use one of these instead of disabling security:
+# api_key = "<base64 id:key>"
+# es_basic_auth = "elastic:changeme"

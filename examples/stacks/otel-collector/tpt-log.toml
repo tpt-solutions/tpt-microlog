@@ -1,0 +1,10 @@
+#:schema https://raw.githubusercontent.com/tpt-solutions/tpt-microlog/master/tpt-log-core/tpt-log.schema.json
+# gRPC to the collector (port 4317):
+preset = "otel-collector"
+service = "demo-app"
+batch_size = 20
+flush_interval_ms = 1000
+
+# ...or OTLP/HTTP (port 4318) instead - replace the preset line above with:
+# backend = "otlp-http"
+# endpoint = "http://localhost:4318"

@@ -21,30 +21,50 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build release WASM
         run: cargo build --release -p tpt-log-wasm --target wasm32-unknown-unknown
-      - name: Size budget (spec: < 3 MB)
+      - name: "Size budget (spec: < 3 MB)"
         run: |
           size=$(stat -c %s target/wasm32-unknown-unknown/release/tpt_log_wasm.wasm)
           echo "wasm size: $size bytes"
           [ "$size" -lt 3145728 ] || {
             echo "WASM binary exceeds the 3 MB budget"; exit 1; }
+      - name: wasm-bindgen version (the CLI must match Cargo.lock exactly)
+        id: wb
+        run: |
+          v=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p')
+          echo "version=$v" >> "$GITHUB_OUTPUT"
       - name: Install wasm-bindgen CLI
         uses: jetli/wasm-bindgen-action@v0.2.0
         with:
-          version: "0.2.129"
+          version: ${{ steps.wb.outputs.version }}
       - name: Install binaryen (wasm-opt)
         uses: jetli/binaryen-action@v0.4.0
         with:
           version: "latest"
-      - name: Optimize binary and generate JS glue
+      # Order matters: wasm-bindgen must see the *unoptimized* module (it
+      # reads descriptor exports that -Oz may inline away), so generate the
+      # glue first and run wasm-opt on the resulting `_bg.wasm`.
+      - name: Generate JS glue, then optimize
         run: |
-          wasm-opt -Oz -o optimized.wasm \
-            target/wasm32-unknown-unknown/release/tpt_log_wasm.wasm
           mkdir -p tpt-log-wasm/dist
-          wasm-bindgen --target web --out-dir tpt-log-wasm/dist optimized.wasm
+          wasm-bindgen --target web --out-dir tpt-log-wasm/dist \
+            target/wasm32-unknown-unknown/release/tpt_log_wasm.wasm
+          before=$(stat -c %s tpt-log-wasm/dist/tpt_log_wasm_bg.wasm)
+          wasm-opt -Oz --enable-bulk-memory --enable-nontrapping-float-to-int \
+            -o tpt-log-wasm/dist/optimized_bg.wasm tpt-log-wasm/dist/tpt_log_wasm_bg.wasm
           mv tpt-log-wasm/dist/optimized_bg.wasm tpt-log-wasm/dist/tpt_log_wasm_bg.wasm
-          mv tpt-log-wasm/dist/optimized.d.ts tpt-log-wasm/dist/tpt_log_wasm.d.ts
-          mv tpt-log-wasm/dist/optimized_bg.wasm.d.ts tpt-log-wasm/dist/tpt_log_wasm_bg.wasm.d.ts
-          mv tpt-log-wasm/dist/optimized.js tpt-log-wasm/dist/tpt_log_wasm.js
+          after=$(stat -c %s tpt-log-wasm/dist/tpt_log_wasm_bg.wasm)
+          echo "wasm-opt: $before -> $after bytes"
+          [ "$after" -le "$before" ] || { echo "wasm-opt grew the binary"; exit 1; }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Node smoke test (same wasm-opt pass applied to the Node build)
+        run: |
+          wasm-bindgen --no-typescript --target nodejs --out-dir wasm-node \
+            target/wasm32-unknown-unknown/release/tpt_log_wasm.wasm
+          wasm-opt -Oz --enable-bulk-memory --enable-nontrapping-float-to-int \
+            -o wasm-node/tpt_log_wasm_bg.wasm wasm-node/tpt_log_wasm_bg.wasm
+          node tpt-log-wasm/tests/smoke.mjs wasm-node/tpt_log_wasm.js
       # tpt-log-wasm/README.md and CHANGELOG.md are committed per-crate docs and
       # are published as-is; do not overwrite them with the workspace overview.
       - uses: actions/upload-artifact@v4

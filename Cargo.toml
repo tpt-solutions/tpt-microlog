@@ -4,6 +4,7 @@ members = [
     "tpt-log-core",
     "tpt-log-transport",
     "tpt-log-ffi",
+    "tpt-log-cli",
     "tpt-log-py",
     "tpt-log-wasm",
 ]
@@ -11,6 +12,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/tpt-solutions/tpt-microlog"
 authors = ["TPT Solutions"]

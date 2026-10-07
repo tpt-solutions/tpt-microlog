@@ -1,0 +1,19 @@
+[package]
+name = "tpt-log-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "tpt-microlog command line: init, doctor, WAL inspection/replay, tail, send-test."
+publish = false
+
+[[bin]]
+name = "tpt-microlog"
+path = "src/main.rs"
+
+[dependencies]
+tpt-log-core = { path = "../tpt-log-core", version = "0.1.0" }
+tpt-log-transport = { path = "../tpt-log-transport", version = "0.1.0" }
+serde_json = { workspace = true }

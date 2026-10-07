@@ -1,0 +1,19 @@
+{
+  "title": "tpt-microlog demo",
+  "uid": "tpt-microlog-demo",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "demo_queue_depth by queue",
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 9 },
+      "targets": [
+        { "expr": "demo_queue_depth", "legendFormat": "{{queue}}", "refId": "A" }
+      ]
+    }
+  ]
+}

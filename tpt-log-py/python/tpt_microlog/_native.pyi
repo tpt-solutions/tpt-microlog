@@ -1,6 +1,6 @@
 """Type stubs for the compiled `tpt_microlog._native` extension module."""
 
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 _Metadata = Mapping[str, Any] | None
 
@@ -26,6 +26,20 @@ class MicroLog:
     - sample_rate: fraction of entries to deliver, 0.0-1.0 (default 1.0)
     - enrichment: attach hostname / PID / service to every entry
     - extra_headers: list of "Name=Value" HTTP headers
+    - redact_keys: metadata keys (case-insensitive) whose values are masked
+    - redact_patterns: regexes masked in messages and string metadata
+    - redact_builtin: mask emails, cards, SSNs, JWTs, bearer tokens, AWS keys
+    - filter_tags: drop entries carrying any "tag=value" pair
+    - filter_regex: drop entries whose message matches
+    - sample_rate_by_level: {"DEBUG": 0.1} per-level sampling (WARN+ is never sampled)
+    - queue_full_policy: "block" | "drop_newest" | "drop_oldest"
+    - durability: "best-effort" | "wal-first" (write the WAL before the first send)
+    - shutdown_timeout_ms / wal_retry_interval_ms / wal_dead_letter_replays /
+      retry_after_max_ms: delivery and WAL timing
+    - enrich_env_vars: environment variable names captured into entries
+    - backends / failover: fan-out (or ordered failover) routing, with backend="fanout"
+    - ca_cert / proxy: TLS bundle and HTTP(S) proxy for network backends
+    - preset: "dev", "prod", "grafana-loki", ... applied before other options
     """
 
     def __init__(self, **kwargs: Any) -> None: ...
@@ -52,3 +66,7 @@ class MicroLog:
     def shutdown(self) -> None: ...
 
 def load_config(path: str) -> MicroLog: ...
+def set_on_error(callback: Callable[[str, str], None] | None = None) -> None:
+    """Receive internal failures as (kind, message); kind is one of
+    "delivery", "wal", "worker", "config". Pass None to restore stderr."""
+

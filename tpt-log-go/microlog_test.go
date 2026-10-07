@@ -2,6 +2,7 @@ package microlog
 
 import (
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -120,5 +121,46 @@ func TestWalDirIsUsed(t *testing.T) {
 	// No delivery failures expected; the directory should simply exist.
 	if _, err := filepath.Abs(dir); err != nil {
 		t.Fatalf("Abs: %v", err)
+	}
+}
+
+func TestNewFromTOMLAndErrorHandler(t *testing.T) {
+	var mu sync.Mutex
+	var got []string
+	SetErrorHandler(func(kind, msg string) {
+		mu.Lock()
+		got = append(got, kind+": "+msg)
+		mu.Unlock()
+	})
+	defer SetErrorHandler(nil)
+
+	log, err := NewFromTOML("backend = \"none\"\nredact_keys = [\"token\"]\nwal_enabled = false\n")
+	if err != nil {
+		t.Fatalf("NewFromTOML: %v", err)
+	}
+	defer log.Close()
+	if err := log.Info("hi", map[string]any{"token": "secret"}); err != nil {
+		t.Fatalf("Info: %v", err)
+	}
+
+	if _, err := NewFromTOML("backend = "); err == nil {
+		t.Fatal("expected a parse error")
+	}
+	if l2, err := NewFromTOML("backend = \"none\"\nbogus_key = 1\n"); err == nil {
+		l2.Close()
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	found := false
+	for _, g := range got {
+		if strings.HasPrefix(g, "config:") && strings.Contains(g, "bogus_key") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("error handler did not receive the config warning: %v", got)
+	}
+	if _, err := NewFromTOML(""); err == nil {
+		t.Fatal("expected an error for empty config")
 	}
 }

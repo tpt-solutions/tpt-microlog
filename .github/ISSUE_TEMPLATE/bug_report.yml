@@ -1,0 +1,63 @@
+name: Bug report
+description: Something is lost, duplicated, hangs, crashes or behaves differently from the docs.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. This project takes contributions through issues only,
+        so a precise report is the most useful thing you can send. Please redact
+        API keys, tokens and customer data.
+  - type: dropdown
+    id: binding
+    attributes:
+      label: Binding
+      options:
+        - Rust (tpt-log-core / tpt-log-transport)
+        - Python (tpt-microlog on PyPI)
+        - JavaScript / WASM (tpt-microlog on npm)
+        - Go
+        - C / C++ (tpt-log-ffi)
+        - CLI (tpt-microlog)
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "`pip show tpt-microlog`, `npm ls tpt-microlog`, `cargo tree -i tpt-log-core`, `go list -m`."
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: OS and language/runtime version
+      placeholder: "e.g. Ubuntu 24.04, Python 3.12 / Node 22 / Go 1.23 / rustc 1.89"
+    validations:
+      required: true
+  - type: input
+    id: backend
+    attributes:
+      label: Backend and its version
+      placeholder: "e.g. datadog, loki 3.2, elasticsearch 8.15, file"
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened instead?
+      description: Include error messages, and for missing logs the `stats()` counters (dropped_entries, wal_writes, ...) and anything reported via `set_on_error` or stderr.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: The smallest program and `tpt-log.toml` that shows it. `tpt-microlog doctor` output helps for delivery problems.
+      render: text
+    validations:
+      required: true

@@ -2,6 +2,7 @@
 name = "tpt-log-wasm"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
@@ -23,6 +24,7 @@ wasm-bindgen-futures = "0.4"
 js-sys = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+regex = { version = "1", default-features = false, features = ["std", "unicode-perl", "unicode-case", "perf"] }
 
 [dependencies.web-sys]
 workspace = true

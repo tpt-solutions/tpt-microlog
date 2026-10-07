@@ -1,0 +1,372 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/tpt-solutions/tpt-microlog/blob/master/tpt-log-core/tpt-log.schema.json",
+  "title": "tpt-log.toml",
+  "description": "Configuration for tpt-microlog. Every key is optional; TPT_LOG_* environment variables override file values.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "service": {
+      "type": "string",
+      "description": "Logical service name, attached to every entry when `enrichment` is on."
+    },
+    "backend": {
+      "type": "string",
+      "enum": [
+        "none",
+        "console",
+        "stdout",
+        "fanout",
+        "custom",
+        "http",
+        "datadog",
+        "elasticsearch",
+        "es",
+        "cloudwatch",
+        "prometheus",
+        "grpc",
+        "otlp",
+        "udp",
+        "tcp",
+        "file",
+        "loki",
+        "otlp-http",
+        "splunk"
+      ],
+      "description": "Delivery backend.",
+      "default": "none"
+    },
+    "endpoint": {
+      "type": "string",
+      "description": "Base URL / address for the chosen backend."
+    },
+    "api_key": {
+      "type": "string",
+      "description": "Secret token (Datadog DD-API-KEY, Splunk HEC token, Bearer token...). Prefer TPT_LOG_API_KEY over committing it."
+    },
+    "extra_headers": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Extra HTTP headers as `name=value` entries."
+    },
+    "grpc_endpoint": {
+      "type": "string",
+      "description": "gRPC target in `host:port` form (OpenTelemetry Collector default port is 4317)."
+    },
+    "net_endpoint": {
+      "type": "string",
+      "description": "UDP/TCP target in `host:port` form."
+    },
+    "file_path": {
+      "type": "string",
+      "description": "Local JSONL file for the `file` backend."
+    },
+    "file_rotation_bytes": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Rotate the file backend above this many bytes."
+    },
+    "file_rotation_seconds": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Rotate the file backend after this many seconds."
+    },
+    "file_rotations": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of rotated files to keep."
+    },
+    "prometheus_bind": {
+      "type": "string",
+      "description": "Prometheus scrape bind address (`host:port`)."
+    },
+    "aws_region": {
+      "type": "string",
+      "description": "CloudWatch region (or the AWS_REGION env var)."
+    },
+    "aws_access_key": {
+      "type": "string",
+      "description": "AWS access key id (or AWS_ACCESS_KEY_ID)."
+    },
+    "aws_secret_key": {
+      "type": "string",
+      "description": "AWS secret key (or AWS_SECRET_ACCESS_KEY)."
+    },
+    "aws_log_group": {
+      "type": "string",
+      "description": "CloudWatch log group."
+    },
+    "aws_log_stream": {
+      "type": "string",
+      "description": "CloudWatch log stream."
+    },
+    "aws_session_token": {
+      "type": "string",
+      "description": "STS session token for temporary credentials."
+    },
+    "aws_auto_create_stream": {
+      "type": "boolean",
+      "description": "Create the log group/stream on first send when missing.",
+      "default": false
+    },
+    "datadog_site": {
+      "type": "string",
+      "description": "Datadog site, e.g. `datadoghq.eu` or `us5.datadoghq.com`."
+    },
+    "datadog_metrics": {
+      "type": "boolean",
+      "description": "Also ship `metric()` entries through the Datadog Metrics API.",
+      "default": false
+    },
+    "es_index": {
+      "type": "string",
+      "description": "Elasticsearch index name (default `tpt-microlog`)."
+    },
+    "es_basic_auth": {
+      "type": "string",
+      "description": "Elasticsearch basic auth as `user:password`."
+    },
+    "body_mode": {
+      "type": "string",
+      "enum": [
+        "json",
+        "zstd"
+      ],
+      "description": "Generic HTTP body encoding: plain JSON (default) or opt-in zstd.",
+      "default": "json"
+    },
+    "tcp_ack": {
+      "type": "boolean",
+      "description": "Ask the TCP receiver for a 1-byte ack after each frame.",
+      "default": false
+    },
+    "ca_cert": {
+      "type": "string",
+      "description": "PEM bundle used to verify server TLS certificates."
+    },
+    "proxy": {
+      "type": "string",
+      "description": "HTTP(S) proxy URL for all network backends."
+    },
+    "backends": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Backends to route to when `backend = \"fanout\"`."
+    },
+    "failover": {
+      "type": "boolean",
+      "description": "With fanout: stop at the first successful backend instead of sending to all.",
+      "default": false
+    },
+    "preset": {
+      "type": "string",
+      "enum": [
+        "dev",
+        "prod",
+        "datadog-eu",
+        "elastic-cloud",
+        "grafana-loki",
+        "otel-collector",
+        "cloudwatch-lambda"
+      ],
+      "description": "Named configuration preset applied on load."
+    },
+    "batch_size": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 100,
+      "description": "Flush a batch at this many entries."
+    },
+    "flush_interval_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 1000,
+      "description": "Flush at least this often (ms)."
+    },
+    "memory_limit_bytes": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Flush once buffered bytes exceed this."
+    },
+    "queue_capacity": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 10000,
+      "description": "Ingestion queue capacity."
+    },
+    "queue_full_policy": {
+      "type": "string",
+      "enum": [
+        "block",
+        "drop_newest",
+        "drop_oldest"
+      ],
+      "description": "Behavior when the ingestion queue is full.",
+      "default": "block"
+    },
+    "compression_level": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 22,
+      "default": 3,
+      "description": "zstd compression level."
+    },
+    "fast_mode": {
+      "type": "boolean",
+      "description": "Disable compression for extreme throughput.",
+      "default": false
+    },
+    "max_retries": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 10,
+      "description": "Maximum delivery attempts (exponential backoff)."
+    },
+    "retry_base_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 1000,
+      "description": "Initial backoff delay (ms)."
+    },
+    "retry_max_backoff_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 60000,
+      "description": "Backoff ceiling (ms)."
+    },
+    "retry_after_max_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 120000,
+      "description": "Honor `Retry-After` up to this cap (ms)."
+    },
+    "wal_enabled": {
+      "type": "boolean",
+      "description": "Enable write-ahead log persistence.",
+      "default": true
+    },
+    "wal_dir": {
+      "type": "string",
+      "description": "WAL directory (`~` is expanded)."
+    },
+    "wal_max_size_bytes": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "WAL size cap in bytes (oldest dropped first)."
+    },
+    "wal_retry_interval_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 5000,
+      "description": "WAL replay interval (ms)."
+    },
+    "wal_dead_letter_replays": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 8,
+      "description": "Move a WAL file to `wal/dead/` after this many failed replays."
+    },
+    "durability": {
+      "type": "string",
+      "enum": [
+        "best-effort",
+        "wal-first"
+      ],
+      "description": "`wal-first` writes every batch to the WAL before the first delivery attempt.",
+      "default": "best-effort"
+    },
+    "shutdown_timeout_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 5000,
+      "description": "Hard budget for shutdown(); leftovers spill to the WAL."
+    },
+    "enrichment": {
+      "type": "boolean",
+      "description": "Attach hostname / PID / service / env vars to every entry."
+    },
+    "enrich_env_vars": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Environment variable names captured into enriched entries."
+    },
+    "min_level": {
+      "type": "string",
+      "enum": [
+        "TRACE",
+        "DEBUG",
+        "INFO",
+        "WARN",
+        "ERROR",
+        "FATAL"
+      ],
+      "description": "Drop entries below this level."
+    },
+    "sample_rate": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 1,
+      "description": "Fraction of entries delivered. WARN and above are never sampled."
+    },
+    "sample_rate_by_level": {
+      "type": "object",
+      "propertyNames": {
+        "enum": [
+          "TRACE",
+          "DEBUG",
+          "INFO",
+          "WARN",
+          "ERROR",
+          "FATAL"
+        ]
+      },
+      "additionalProperties": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1
+      },
+      "description": "Per-level sampling overrides, e.g. `DEBUG = 0.1`."
+    },
+    "filter_tags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Drop entries carrying any of these `tag=value` pairs."
+    },
+    "filter_regex": {
+      "type": "string",
+      "description": "Drop entries whose message matches this regex."
+    },
+    "redact_keys": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Metadata keys (case-insensitive) whose values are always masked."
+    },
+    "redact_patterns": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Regexes masked in messages and string metadata."
+    },
+    "redact_builtin": {
+      "type": "boolean",
+      "description": "Enable built-in detectors: email, card, SSN, JWT, bearer token, AWS key.",
+      "default": false
+    },
+    "wal_frame_newline": {
+      "type": "boolean",
+      "description": "Use newline-delimited base64 framing for the WAL."
+    }
+  }
+}

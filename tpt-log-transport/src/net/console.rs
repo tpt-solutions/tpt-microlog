@@ -7,19 +7,21 @@
 //! Creating the transport prints a one-time startup banner (TTY only) so
 //! developers always know where their logs are going.
 
-use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
+use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use tpt_log_core::{CompressedBatch, Config, LogEntry, LogLevel, LogType, Transport, TransportError};
+use tpt_log_core::{
+    CompressedBatch, Config, LogEntry, LogLevel, LogType, Transport, TransportError,
+};
 
 /// ANSI color sequences per level (TTY output only).
 fn color_for(level: LogLevel) -> &'static str {
     match level {
-        LogLevel::Trace => "\x1b[90m", // bright black
-        LogLevel::Debug => "\x1b[36m", // cyan
-        LogLevel::Info => "\x1b[32m",  // green
-        LogLevel::Warn => "\x1b[33m",  // yellow
-        LogLevel::Error => "\x1b[31m", // red
+        LogLevel::Trace => "\x1b[90m",   // bright black
+        LogLevel::Debug => "\x1b[36m",   // cyan
+        LogLevel::Info => "\x1b[32m",    // green
+        LogLevel::Warn => "\x1b[33m",    // yellow
+        LogLevel::Error => "\x1b[31m",   // red
         LogLevel::Fatal => "\x1b[1;31m", // bold red
     }
 }
@@ -141,9 +143,9 @@ impl Transport for ConsoleTransport {
 /// Drain a length-prefixed frame from a reader. Kept here so the console
 /// module mirrors the file transport's test helpers.
 #[cfg(test)]
-pub(crate) fn read_line(reader: &mut impl BufRead) -> std::io::Result<String> {
+pub(crate) fn read_line(reader: &mut impl std::io::BufRead) -> std::io::Result<String> {
     let mut line = String::new();
-    reader.read_line(&mut line)?;
+    std::io::BufRead::read_line(reader, &mut line)?;
     Ok(line)
 }
 
@@ -159,7 +161,10 @@ mod tests {
         e.metadata.insert("zebra".into(), serde_json::json!(1));
         e.metadata.insert("alpha".into(), serde_json::json!("x"));
         let line = pretty(&e);
-        assert!(line.starts_with("01:01:01.000 WARN  disk nearly full"), "{line}");
+        assert!(
+            line.starts_with("01:01:01.000 WARN  disk nearly full"),
+            "{line}"
+        );
         assert!(line.contains("alpha=x zebra=1"), "{line}");
     }
 
@@ -174,10 +179,13 @@ mod tests {
 
     #[test]
     fn value_helper_still_used_by_metrics() {
-        let mut e = LogEntry::metric("cpu", 0.5, None);
-        assert_eq!(
-            e.metadata.get("value").and_then(value_as_number),
-            Some(0.5)
-        );
+        let e = LogEntry::metric("cpu", 0.5, None);
+        assert_eq!(e.metadata.get("value").and_then(value_as_number), Some(0.5));
+    }
+
+    #[test]
+    fn read_line_helper_parses() {
+        let mut reader = std::io::BufReader::new(&b"first\nsecond\n"[..]);
+        assert_eq!(read_line(&mut reader).unwrap(), "first\n");
     }
 }

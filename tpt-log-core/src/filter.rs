@@ -18,6 +18,8 @@ pub struct EntryProcessor {
     /// Per-level sampling overrides (level → rate).
     pub sample_rate_by_level: Vec<(LogLevel, f64)>,
     pub enrichment: Option<EnrichmentContext>,
+    /// PII/secret redaction, applied last so dropped entries cost nothing.
+    pub redactor: crate::redact::Redactor,
 }
 
 impl std::fmt::Debug for EntryProcessor {
@@ -42,6 +44,7 @@ impl Default for EntryProcessor {
             sample_rate: 1.0,
             sample_rate_by_level: Vec::new(),
             enrichment: None,
+            redactor: crate::redact::Redactor::default(),
         }
     }
 }
@@ -66,6 +69,7 @@ impl EntryProcessor {
             || self.enrichment.is_some()
             || self.drop_regex.is_some()
             || !self.drop_tags.is_empty()
+            || self.redactor.is_enabled()
     }
 
     /// Effective sampling rate for `entry`: WARN and above are never sampled,
@@ -147,6 +151,7 @@ impl EntryProcessor {
                     .or_insert(serde_json::Value::String(value.clone()));
             }
         }
+        self.redactor.apply(entry);
         true
     }
 }

@@ -37,6 +37,17 @@ export interface MicroLogOptions {
   sampleRate?: number;
   /** Cap on buffered entries during outages; oldest are dropped (default 10 000). */
   maxBuffer?: number;
+  /** Metadata keys (case-insensitive) whose values are always masked. */
+  redactKeys?: string[];
+  /** Regexes (Rust regex syntax) masked in messages and string metadata. */
+  redactPatterns?: string[];
+  /** Mask emails, card numbers, SSNs, JWTs, bearer tokens and AWS keys. */
+  redactBuiltin?: boolean;
+  /**
+   * Receives internal failures as `(kind, message)`; kind is `"delivery"` or
+   * `"config"`. Defaults to `console.warn`.
+   */
+  onError?: (kind: string, message: string) => void;
 }
 
 /**

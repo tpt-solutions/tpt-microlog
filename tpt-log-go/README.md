@@ -85,6 +85,20 @@ func main() {
 A complete example is available in
 [`examples/go/datadog.go`](../examples/go/datadog.go).
 
+## `log/slog` integration
+
+```go
+logger := slog.New(microlog.NewSlogHandler(log, &slog.HandlerOptions{Level: slog.LevelDebug}))
+logger.Info("user logged in", "user_id", 123)
+logger.WithGroup("req").Warn("slow", "ms", 840) // metadata: {"req": {"ms": 840}}
+logger.Log(ctx, microlog.LevelFatal, "unrecoverable")
+```
+
+Levels below DEBUG map to TRACE; `microlog.LevelFatal` (ERROR+4) maps to FATAL.
+Attributes become metadata, groups become nested objects, and errors,
+durations and times are rendered as strings. The handler never closes the
+`MicroLog`.
+
 ## API
 
 | Member | Description |

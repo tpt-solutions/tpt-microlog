@@ -1,0 +1,7 @@
+#:schema https://raw.githubusercontent.com/tpt-solutions/tpt-microlog/master/tpt-log-core/tpt-log.schema.json
+# Pull model: the app serves /metrics itself; Prometheus scrapes it.
+# Bind on all interfaces so a Prometheus container can reach the host process,
+# and avoid 9090 (Prometheus' own port).
+backend = "prometheus"
+prometheus_bind = "0.0.0.0:9464"
+service = "demo-app"

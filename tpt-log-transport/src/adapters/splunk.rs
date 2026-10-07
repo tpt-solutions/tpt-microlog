@@ -119,14 +119,15 @@ impl Transport for SplunkAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tpt_log_core::{LogLevel, LogType, Secret};
+    use tpt_log_core::{LogLevel, Secret};
 
     #[test]
     fn hec_event_shape() {
         let mut e = LogEntry::new(LogLevel::Warn, "disk full");
         e.timestamp = 1_700_000_012_345;
         e.metadata.insert("user".into(), serde_json::json!("bob"));
-        e.metadata.insert("service".into(), serde_json::json!("api"));
+        e.metadata
+            .insert("service".into(), serde_json::json!("api"));
         e.metadata.insert("host".into(), serde_json::json!("box-1"));
         let line = to_hec_event(&e);
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();

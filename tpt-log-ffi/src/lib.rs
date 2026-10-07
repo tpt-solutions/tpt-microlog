@@ -87,10 +87,12 @@ fn parse_metadata(metadata: *const c_char) -> Result<serde_json::Map<String, Val
     Ok(map)
 }
 
-/// Split on commas that sit outside double-quoted spans.
+/// Split on commas that sit outside double-quoted spans and outside nested
+/// JSON objects/arrays (`req={"id":"a","n":2}` is a single pair).
 fn split_pairs(raw: &str) -> impl Iterator<Item = &str> {
     let mut in_quotes = false;
     let mut escaped = false;
+    let mut depth = 0usize;
     let mut start = 0;
     let mut moves = Vec::new();
     for (i, ch) in raw.char_indices() {
@@ -101,7 +103,9 @@ fn split_pairs(raw: &str) -> impl Iterator<Item = &str> {
         match ch {
             '\\' if in_quotes => escaped = true,
             '"' => in_quotes = !in_quotes,
-            ',' if !in_quotes => {
+            '{' | '[' if !in_quotes => depth += 1,
+            '}' | ']' if !in_quotes => depth = depth.saturating_sub(1),
+            ',' if !in_quotes && depth == 0 => {
                 moves.push(&raw[start..i]);
                 start = i + 1;
             }
@@ -554,6 +558,82 @@ pub unsafe extern "C" fn tpt_log_stats_json(
     })
 }
 
+/// C callback for internal diagnostics: `(kind, message, user_data)`. Both
+/// strings are valid only for the duration of the call.
+pub type TptLogErrorCallback = Option<
+    unsafe extern "C" fn(kind: *const c_char, message: *const c_char, user: *mut std::ffi::c_void),
+>;
+
+struct UserData(*mut std::ffi::c_void);
+// SAFETY: the C caller promises `user` may be used from any thread.
+unsafe impl Send for UserData {}
+unsafe impl Sync for UserData {}
+
+/// Install (or clear, with a NULL callback) the process-wide diagnostics
+/// callback: delivery failures, WAL problems, worker panics and config
+/// warnings are reported here instead of stderr. The callback may be invoked
+/// from background threads.
+///
+/// # Safety
+/// `callback` must be thread-safe and `user` must stay valid until the
+/// callback is cleared.
+#[no_mangle]
+pub unsafe extern "C" fn tpt_log_set_error_callback(
+    callback: TptLogErrorCallback,
+    user: *mut std::ffi::c_void,
+) {
+    match callback {
+        None => tpt_log_core::set_on_error(None),
+        Some(cb) => {
+            let user = UserData(user);
+            tpt_log_core::set_on_error(Some(Arc::new(move |kind: &str, msg: &str| {
+                let (Ok(k), Ok(m)) = (CString::new(kind), CString::new(msg)) else {
+                    return;
+                };
+                let user = &user;
+                // SAFETY: contract documented on `tpt_log_set_error_callback`.
+                unsafe { cb(k.as_ptr(), m.as_ptr(), user.0) };
+            })));
+        }
+    }
+}
+
+/// Create a logger from a TOML document (the same keys as `tpt-log.toml`,
+/// including `redact_keys` / `redact_patterns` / `redact_builtin`). Returns
+/// NULL on parse or transport errors; see `tpt_log_last_error()`.
+///
+/// # Safety
+/// `toml` must be a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn tpt_log_create_from_toml(toml: *const c_char) -> *mut MicroLogHandle {
+    guarded_ptr(|| {
+        let raw = match str_from_ptr(toml) {
+            Some(Ok(s)) => s,
+            _ => {
+                set_last_error("tpt_log_create_from_toml: NULL or non-UTF-8 argument");
+                return ptr::null_mut();
+            }
+        };
+        let mut built = match Config::from_toml_str(raw) {
+            Ok(c) => c,
+            Err(e) => {
+                set_last_error(&format!("tpt_log_create_from_toml: {e}"));
+                return ptr::null_mut();
+            }
+        };
+        built.apply_env();
+        match build_transport(&built) {
+            Ok(transport) => Box::into_raw(Box::new(MicroLogHandle {
+                inner: CoreLog::new(built, Arc::from(transport)),
+            })),
+            Err(e) => {
+                set_last_error(&format!("tpt_log_create_from_toml: {e}"));
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
 /// Library version string (static, valid for the program lifetime).
 #[no_mangle]
 pub extern "C" fn tpt_log_version() -> *const c_char {
@@ -588,6 +668,16 @@ pub extern "C" fn tpt_log_last_error() -> *const c_char {
 mod tests {
     use super::*;
 
+    #[test]
+    fn nested_json_values_are_not_split_at_inner_commas() {
+        let raw = CString::new(r#"a=1,req={"id":"x","n":2,"l":[1,2]},msg="p,q",b=true"#).unwrap();
+        let map = parse_metadata(raw.as_ptr()).unwrap();
+        assert_eq!(map.len(), 4, "{map:?}");
+        assert_eq!(map["req"]["l"][1], 2);
+        assert_eq!(map["msg"], "p,q");
+        assert_eq!(map["b"], true);
+    }
+
     fn make_logger() -> (*mut MicroLogHandle, tempdir::TempDirGuard) {
         let dir = tempdir::create();
         let wal_dir = CString::new(dir.path.to_string_lossy().into_owned()).unwrap();
@@ -610,6 +700,7 @@ mod tests {
 
     mod tempdir {
         use std::path::PathBuf;
+        use std::sync::atomic::{AtomicU32, Ordering};
         pub struct TempDirGuard {
             pub path: PathBuf,
         }
@@ -618,8 +709,19 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&self.path);
             }
         }
+        /// Unique per call: tests run in parallel and the WAL takes an advisory
+        /// lock per directory, so a shared name would fail the second logger.
         pub fn create() -> TempDirGuard {
-            let path = std::env::temp_dir().join(format!("tpt-ffi-test-{}", std::process::id()));
+            static SEQ: AtomicU32 = AtomicU32::new(0);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let path = std::env::temp_dir().join(format!(
+                "tpt-ffi-test-{}-{nanos}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
             let _ = std::fs::remove_dir_all(&path);
             std::fs::create_dir_all(&path).unwrap();
             TempDirGuard { path }

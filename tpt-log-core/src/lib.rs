@@ -7,18 +7,22 @@
 
 pub mod batch;
 pub mod config;
+pub mod diag;
 pub mod entry;
 pub mod filter;
+pub mod integrations;
 pub mod level;
 pub mod log_type;
 pub mod microlog;
 pub mod queue;
+pub mod redact;
 pub mod retry;
 pub mod transport;
 pub mod wal;
 
 pub use batch::{Batch, CompressedBatch, Compressor};
 pub use config::{BodyMode, Config, Durability, QueueFullPolicy, Secret};
+pub use diag::set_on_error;
 pub use entry::LogEntry;
 pub use level::LogLevel;
 pub use log_type::LogType;

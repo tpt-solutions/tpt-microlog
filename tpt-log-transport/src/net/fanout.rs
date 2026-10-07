@@ -46,7 +46,10 @@ impl RoutingTransport {
 
     /// Route according to the given mode.
     pub fn new(transports: Vec<Box<dyn Transport>>, failover: bool) -> Self {
-        Self { transports, failover }
+        Self {
+            transports,
+            failover,
+        }
     }
 
     /// Number of routed backends.
@@ -68,8 +71,7 @@ impl Transport for RoutingTransport {
                 match transport.send(batch) {
                     Ok(()) => return Ok(()),
                     // Permanent rejections are unlikely to heal: advance.
-                    Err(e @ TransportError::Permanent(_))
-                    | Err(e @ TransportError::Config(_)) => {
+                    Err(e @ TransportError::Permanent(_)) | Err(e @ TransportError::Config(_)) => {
                         last = e;
                     }
                     Err(e) => return Err(e),
@@ -77,6 +79,11 @@ impl Transport for RoutingTransport {
             }
             Err(last)
         } else {
+            if self.transports.is_empty() {
+                return Err(TransportError::Config(
+                    "fanout backend list is empty".into(),
+                ));
+            }
             let mut first_error: Option<TransportError> = None;
             for transport in &self.transports {
                 if let Err(e) = transport.send(batch) {
@@ -155,6 +162,22 @@ mod tests {
         }
     }
 
+    /// Wrap a stub so it satisfies `Box<dyn Transport>`.
+    fn boxed(stub: Arc<Stub>) -> Box<dyn Transport> {
+        Box::new(StubTransport(stub))
+    }
+
+    struct StubTransport(Arc<Stub>);
+
+    impl Transport for StubTransport {
+        fn send(&self, b: &CompressedBatch) -> Result<(), TransportError> {
+            self.0.send(b)
+        }
+        fn name(&self) -> &str {
+            self.0.name()
+        }
+    }
+
     fn stubs() -> (Arc<Stub>, Arc<Stub>) {
         (
             Arc::new(Stub::err("first", "permanent")),
@@ -166,7 +189,8 @@ mod tests {
     fn fanout_delivers_to_all_and_reports_first_failure() {
         let (a, b) = stubs();
         let ok = Arc::new(Stub::ok("ok"));
-        let router = RoutingTransport::fanout(vec![Box::new(a.clone()), Box::new(ok.clone()), Box::new(b.clone())]);
+        let router =
+            RoutingTransport::fanout(vec![boxed(a.clone()), boxed(ok.clone()), boxed(b.clone())]);
         let err = router.send(&batch()).unwrap_err();
         assert!(matches!(err, TransportError::Permanent(_)));
         assert_eq!(a.calls(), 1);
@@ -178,8 +202,11 @@ mod tests {
     fn failover_stops_at_first_success_and_skips_permanent() {
         let (a, b) = stubs();
         let never = Arc::new(Stub::err("third", "permanent"));
-        let router =
-            RoutingTransport::failover(vec![Box::new(a.clone()), Box::new(b.clone()), Box::new(never.clone())]);
+        let router = RoutingTransport::failover(vec![
+            boxed(a.clone()),
+            boxed(b.clone()),
+            boxed(never.clone()),
+        ]);
         router.send(&batch()).unwrap();
         assert_eq!(a.calls(), 1, "permanent error advances to the next backend");
         assert_eq!(b.calls(), 1);
@@ -190,10 +217,14 @@ mod tests {
     fn failover_transient_stops_for_retry() {
         let t = Arc::new(Stub::err("down", "transient"));
         let ok = Arc::new(Stub::ok("healthy"));
-        let router = RoutingTransport::failover(vec![Box::new(t.clone()), Box::new(ok.clone())]);
+        let router = RoutingTransport::failover(vec![boxed(t.clone()), boxed(ok.clone())]);
         let err = router.send(&batch()).unwrap_err();
         assert!(matches!(err, TransportError::Transient(_)));
-        assert_eq!(ok.calls(), 0, "transient errors must not burn later backends");
+        assert_eq!(
+            ok.calls(),
+            0,
+            "transient errors must not burn later backends"
+        );
     }
 
     #[test]

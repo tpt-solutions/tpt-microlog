@@ -106,6 +106,10 @@ log.info(msg) -> LogQueue (bounded MPSC)
 
 Layering is **code overrides > `TPT_LOG_*` env vars > `tpt-log.toml` > defaults**.
 
+Editor completion and validation: add `#:schema https://raw.githubusercontent.com/tpt-solutions/tpt-microlog/master/tpt-log-core/tpt-log.schema.json`
+as the first line (Taplo / Even Better TOML), or point your editor at
+[`tpt-log.schema.json`](tpt-log.schema.json). `tpt-microlog init` adds it for you.
+
 ```toml
 # tpt-log.toml
 backend = "none"             # none|custom|datadog|elasticsearch|cloudwatch|prometheus|grpc|udp|tcp|file
@@ -149,9 +153,38 @@ Defaults live in the [`defaults`] module (`BATCH_SIZE`, `FLUSH_INTERVAL_MS`,
 Entries serialize to JSON via serde, with `message`, `level`, `log_type`,
 `timestamp`, and a free-form `metadata` map.
 
+## Rust ecosystem integration
+
+```rust
+use std::sync::Arc;
+use tpt_log_core::{install_panic_hook, mlog};
+use tpt_log_transport::Builder;
+
+let log: Arc<_> = Builder::new()                // config file + TPT_LOG_* env
+    .backend("datadog").api_key("...").service("checkout")
+    .redact_keys(["password", "token"])
+    .build_arc()?;
+
+install_panic_hook(log.clone());                 // panics -> FATAL entry + flush
+mlog!(log, Info, "user logged in", user_id = 123, ip = "1.2.3.4");
+```
+
+- **`tracing`** (feature `tracing`): `MicroLogLayer::new(log).with_spans(true)`
+  in `tpt_log_core::integrations::tracing_layer`. Events become entries with
+  their fields, target and enclosing spans as metadata; closed spans can be
+  recorded as trace spans.
+- **`log`** (feature `log`): `integrations::log_facade::init(log, LevelFilter::Info)`.
+- Records from the delivery stack itself (`hyper`, `reqwest`, `rustls`,
+  `tonic`, ... and every `tpt_log_*` crate) are never forwarded, so network
+  chatter cannot feed back into the next batch.
+- The integrations take an `Arc<MicroLog>` because dropping a `MicroLog`
+  shuts it down.
+
 ## Features
 
 - `test-utils` — exposes test-only helpers such as `SpyTransport`.
+- `tracing` — the `tracing-subscriber` layer.
+- `log` — the `log` facade backend.
 
 ## Benchmark
 

@@ -36,6 +36,23 @@ const DISPATCH_CAPACITY: usize = 512;
 /// How many times a worker thread may panic before it is left dead.
 const MAX_WORKER_RESTARTS: u32 = 5;
 
+/// Guard marking a batch as being delivered (increments on entry, decrements
+/// on drop) so `flush()` can wait for true delivery rather than hand-off.
+struct BusyGuard<'a>(&'a AtomicU64);
+
+impl BusyGuard<'_> {
+    fn enter(counter: &AtomicU64) -> BusyGuard<'_> {
+        counter.fetch_add(1, Ordering::AcqRel);
+        BusyGuard(counter)
+    }
+}
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 struct DeliveryEngine {
     transport: Arc<dyn Transport>,
     retry: RetryPolicy,
@@ -45,6 +62,10 @@ struct DeliveryEngine {
     retry_after_max_ms: u64,
     stats: Arc<Stats>,
     rx: Receiver<CompressedBatch>,
+    /// Number of batches currently being handed to the transport. `flush()`
+    /// waits for this to reach zero so "flushed" means "delivered or
+    /// persisted", not merely "handed off".
+    busy: AtomicU64,
     stop_requested: Arc<AtomicBool>,
     tick_ms: u64,
 }
@@ -53,6 +74,11 @@ impl DeliveryEngine {
     /// Number of batches waiting in the dispatch channel.
     fn inflight(&self) -> usize {
         self.rx.len()
+    }
+
+    /// No batch is queued or in the middle of a delivery attempt.
+    fn idle(&self) -> bool {
+        self.rx.is_empty() && self.busy.load(Ordering::Acquire) == 0
     }
 
     /// Deliver a batch with backoff + jitter, honoring the stop flag so
@@ -68,12 +94,17 @@ impl DeliveryEngine {
                         attempts: failures + 1,
                     }
                 }
-                Err(TransportError::Permanent(_)) | Err(TransportError::Config(_)) => {
+                Err(e @ TransportError::Permanent(_)) | Err(e @ TransportError::Config(_)) => {
+                    crate::diag::report("delivery", &format!("permanent delivery failure: {e}"));
                     return RetryOutcome::Permanent;
                 }
                 Err(err) => {
                     failures += 1;
                     if failures >= attempts_allowed {
+                        crate::diag::report(
+                            "delivery",
+                            &format!("delivery gave up after {failures} attempts: {err}"),
+                        );
                         return RetryOutcome::Exhausted { attempts: failures };
                     }
                     if self.stop_requested.load(Ordering::Relaxed) {
@@ -92,6 +123,10 @@ impl DeliveryEngine {
     }
 
     fn dispatch(&self, batch: &CompressedBatch) {
+        // The sender already counted this batch as in flight (see
+        // `flush_batch`), so the channel→worker hand-off never looks idle;
+        // this guard only releases the count when delivery finishes.
+        let _busy = BusyGuard(&self.busy);
         if self.durability == Durability::WalFirst {
             if let Some(wal) = &self.wal {
                 match wal.write(batch) {
@@ -114,7 +149,7 @@ impl DeliveryEngine {
                         return;
                     }
                     Err(e) => {
-                        eprintln!("tpt-microlog: wal-first pre-write failed: {e}");
+                        crate::diag::report("wal", &format!("wal-first pre-write failed: {e}"));
                         // fall through to best-effort delivery below
                     }
                 }
@@ -157,6 +192,7 @@ impl DeliveryEngine {
         let Ok(paths) = wal.pending_paths() else {
             return;
         };
+        let _busy = BusyGuard::enter(&self.busy);
         for path in paths {
             let frame = match wal.read_frame(&path) {
                 Ok(frame) => frame,
@@ -209,6 +245,8 @@ impl DeliveryEngine {
     /// count them dropped) — used when `shutdown()` runs out of budget.
     fn spill_dispatch_to_wal(&self) {
         while let Ok(batch) = self.rx.try_recv() {
+            // Counted at send time; this batch leaves the pipeline here.
+            self.busy.fetch_sub(1, Ordering::AcqRel);
             let stored = self
                 .wal
                 .as_ref()
@@ -331,8 +369,9 @@ fn supervised(name: &'static str, body: impl Fn() + Send + Sync + 'static) {
             Ok(()) => return,
             Err(payload) => {
                 if restart == MAX_WORKER_RESTARTS {
-                    eprintln!(
-                        "tpt-microlog: {name} worker exceeded panic restart budget; giving up"
+                    crate::diag::report(
+                        "worker",
+                        &format!("{name} worker exceeded panic restart budget; giving up"),
                     );
                     return;
                 }
@@ -341,7 +380,10 @@ fn supervised(name: &'static str, body: impl Fn() + Send + Sync + 'static) {
                     .map(|s| (*s).to_string())
                     .or_else(|| payload.downcast_ref::<String>().cloned())
                     .unwrap_or_else(|| "unknown panic".to_string());
-                eprintln!("tpt-microlog: {name} worker panicked ({msg}); restarting");
+                crate::diag::report(
+                    "worker",
+                    &format!("{name} worker panicked ({msg}); restarting"),
+                );
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
@@ -412,7 +454,7 @@ impl MicroLog {
             match Wal::open(dir, config.wal_max_size_bytes) {
                 Ok(w) => Some(Arc::new(w)),
                 Err(e) => {
-                    eprintln!("tpt-microlog: WAL disabled: {e}");
+                    crate::diag::report("wal", &format!("WAL disabled: {e}"));
                     None
                 }
             }
@@ -432,6 +474,7 @@ impl MicroLog {
             retry_after_max_ms,
             stats: stats.clone(),
             rx: delivery_rx,
+            busy: AtomicU64::new(0),
             stop_requested: stop_requested.clone(),
             tick_ms: wal_retry_interval,
         });
@@ -455,10 +498,18 @@ impl MicroLog {
                 .and_then(|pattern| {
                     let compiled = regex::Regex::new(pattern);
                     if let Err(e) = &compiled {
-                        eprintln!("tpt-microlog: ignoring invalid filter_regex: {e}");
+                        crate::diag::report(
+                            "config",
+                            &format!("ignoring invalid filter_regex: {e}"),
+                        );
                     }
                     compiled.ok()
                 }),
+            redactor: crate::redact::Redactor::new(
+                &config_for_processor.redact_keys,
+                &config_for_processor.redact_patterns,
+                config_for_processor.redact_builtin,
+            ),
             sample_rate: config_for_processor.sample_rate,
             sample_rate_by_level,
             enrichment: if config_for_processor.enrichment {
@@ -569,13 +620,19 @@ impl MicroLog {
         self.inner.engine.inflight()
     }
 
+    /// `true` when nothing is buffered, queued, or mid-delivery.
+    pub fn is_idle(&self) -> bool {
+        self.inner.queue.is_empty() && self.inner.engine.idle()
+    }
+
     /// Ask the batcher to flush buffered entries now and wait (bounded by
     /// `shutdown_timeout_ms`) until the ingestion queue and dispatch channel
-    /// have drained. Returns `true` when everything is in flight or delivered.
+    /// have drained *and* the delivery worker has finished with the batches.
+    /// Returns `true` when everything was delivered or made durable.
     pub fn flush(&self) -> bool {
         let inner = &self.inner;
         if inner.detached.load(Ordering::Relaxed) || inner.shutdown_done.load(Ordering::SeqCst) {
-            return inner.queue.is_empty() && inner.engine.inflight() == 0;
+            return self.is_idle();
         }
         let (ack_tx, ack_rx) = crossbeam_channel::bounded::<()>(1);
         inner.flush_waiters.lock().push(ack_tx);
@@ -586,12 +643,12 @@ impl MicroLog {
         // Wait for the queue and dispatch channel to drain.
         let deadline = Instant::now() + budget;
         while Instant::now() < deadline {
-            if inner.queue.is_empty() && inner.engine.inflight() == 0 {
+            if self.is_idle() {
                 return true;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        inner.queue.is_empty() && inner.engine.inflight() == 0
+        self.is_idle()
     }
 
     /// Called once in a forked child: worker threads do not exist there, so
@@ -723,8 +780,14 @@ impl MicroLog {
         // 3. Stop + join the delivery worker (drains channel + replays WAL).
         inner.stop_requested.store(true, Ordering::SeqCst);
         if !inner.delivery.join_within(remaining()) {
-            // Daemon: it holds only `Arc`s and will finish on its own.
+            // Daemon: it holds only `Arc`s and will finish on its own, so the
+            // WAL lock must stay held while it may still write.
             inner.engine.spill_dispatch_to_wal();
+        } else if let Some(wal) = &inner.engine.wal {
+            // Both workers have exited: free the directory so a logger
+            // recreated in this process can open the same WAL right away
+            // (not only after this object is garbage-collected).
+            wal.release_lock();
         }
     }
 }
@@ -851,7 +914,13 @@ fn flush_batch(inner: &MicroLogInner, pending: &mut Vec<LogEntry>, pending_bytes
     let count = entries.len();
     let batch = Batch { entries };
     let cb = inner.compressor.compress_batch(&batch, count);
+    // Count the batch as in flight *before* it becomes visible to the
+    // delivery worker; otherwise there is a window between `recv` and the
+    // worker's own bookkeeping where `flush()` would see an idle engine and
+    // return before the batch was delivered.
+    inner.engine.busy.fetch_add(1, Ordering::AcqRel);
     if inner.delivery_tx.send(cb).is_err() {
+        inner.engine.busy.fetch_sub(1, Ordering::AcqRel);
         inner.stats.dropped_batches.fetch_add(1, Ordering::Relaxed);
     }
 }

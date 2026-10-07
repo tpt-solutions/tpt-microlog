@@ -49,6 +49,22 @@ log.info("started", pid=1234)
 log.shutdown()
 ```
 
+## `logging` integration
+
+```python
+import logging
+from tpt_microlog.handler import MicroLogHandler
+
+logging.getLogger().addHandler(MicroLogHandler(backend="datadog", api_key="..."))
+logging.getLogger("checkout").warning("slow query", extra={"ms": 840})
+```
+
+Pass `log=` to share an existing `MicroLog` instead of creating one (a shared
+logger is flushed, not shut down, when the handler closes). Each record carries
+`logger`, `module`, `function`, `line` and `thread` metadata, every `extra=`
+field, and the traceback under `exception`. `CRITICAL` maps to FATAL and levels
+below DEBUG map to TRACE.
+
 ## API
 
 | Member | Description |

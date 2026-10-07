@@ -144,6 +144,38 @@ mod native {
                 config.body_mode = mode.parse().map_err(|e: String| PyValueError::new_err(e))?;
             }
             "tcp_ack" => config.tcp_ack = value.extract()?,
+            "queue_full_policy" => {
+                let v: String = value.extract()?;
+                config.queue_full_policy =
+                    v.parse().map_err(|e: String| PyValueError::new_err(e))?;
+            }
+            "durability" => {
+                let v: String = value.extract()?;
+                config.durability = v.parse().map_err(|e: String| PyValueError::new_err(e))?;
+            }
+            "shutdown_timeout_ms" => config.shutdown_timeout_ms = value.extract()?,
+            "wal_retry_interval_ms" => config.wal_retry_interval_ms = value.extract()?,
+            "wal_dead_letter_replays" => config.wal_dead_letter_replays = value.extract()?,
+            "retry_after_max_ms" => config.retry_after_max_ms = value.extract()?,
+            "sample_rate_by_level" => {
+                config.sample_rate_by_level =
+                    value.extract::<std::collections::BTreeMap<String, f64>>()?
+            }
+            "enrich_env_vars" => config.enrich_env_vars = value.extract()?,
+            "backends" => config.backends = value.extract()?,
+            "failover" => config.failover = value.extract()?,
+            "ca_cert" => config.ca_cert = value.extract()?,
+            "proxy" => config.proxy = value.extract()?,
+            "preset" => {
+                let name: String = value.extract()?;
+                config.apply_preset(&name).map_err(PyValueError::new_err)?;
+                config.preset = Some(name);
+            }
+            "redact_keys" => config.redact_keys = value.extract()?,
+            "redact_patterns" => config.redact_patterns = value.extract()?,
+            "redact_builtin" => config.redact_builtin = value.extract()?,
+            "filter_tags" => config.filter_tags = value.extract()?,
+            "filter_regex" => config.filter_regex = value.extract()?,
             other => {
                 return Err(PyValueError::new_err(format!(
                     "unknown MicroLog option '{other}'"
@@ -176,9 +208,16 @@ mod native {
         fn new(py: Python<'_>, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
             let mut config = Config::load();
             if let Some(kwargs) = kwargs {
+                // A preset is a base layer: apply it first so explicit
+                // options win regardless of keyword order.
+                if let Some(preset) = kwargs.get_item("preset")? {
+                    apply_kwarg(&mut config, "preset", &preset)?;
+                }
                 for (k, v) in kwargs.iter() {
                     let key: String = k.extract()?;
-                    apply_kwarg(&mut config, &key, &v)?;
+                    if key != "preset" {
+                        apply_kwarg(&mut config, &key, &v)?;
+                    }
                 }
             }
             // Building the transport may bind sockets (Prometheus) or read
@@ -362,10 +401,28 @@ mod native {
         })
     }
 
+    /// Install (or clear, with `None`) a process-wide callback
+    /// `(kind, message)` for internal failures: delivery, WAL, worker and
+    /// config problems. It runs on background threads; exceptions it raises
+    /// are swallowed so they can never break delivery.
+    #[pyfunction]
+    #[pyo3(signature = (callback=None))]
+    fn set_on_error(callback: Option<Py<PyAny>>) {
+        match callback {
+            None => tpt_log_core::set_on_error(None),
+            Some(cb) => tpt_log_core::set_on_error(Some(Arc::new(move |kind: &str, msg: &str| {
+                Python::attach(|py| {
+                    let _ = cb.call1(py, (kind, msg));
+                });
+            }))),
+        }
+    }
+
     #[pymodule]
     fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module.add_class::<MicroLog>()?;
         module.add_function(wrap_pyfunction!(load_config, module)?)?;
+        module.add_function(wrap_pyfunction!(set_on_error, module)?)?;
         module.add("__version__", env!("CARGO_PKG_VERSION"))?;
         Ok(())
     }

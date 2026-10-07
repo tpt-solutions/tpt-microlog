@@ -9,6 +9,19 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `tpt-microlog/pino`: a pino destination / worker transport
+  (`createStream`) that forwards pino's JSON lines to tpt-microlog.
+- `redactKeys`, `redactPatterns`, `redactBuiltin` and `onError` options.
+- `exports` map in `package.json` (`.`, `./pino`, `./dist/*`).
+
+### Fixed
+
+- `shutdown()` / `dispose()` cancel the pending flush timer instead of leaving
+  a timeout that fired into a dropped closure.
+- README: the web-target package needs `init()` / `initSync()` before use.
+
 ### Changed — Phase 10 adapter correctness
 
 - `backend: "datadog"` emits Datadog Logs API v2 event arrays

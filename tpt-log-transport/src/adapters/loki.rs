@@ -32,11 +32,13 @@ fn loki_level(entry: &LogEntry) -> String {
     entry.level.to_string().to_ascii_uppercase()
 }
 
+/// One log line: `(timestamp, line, structured metadata)`.
+type StreamValue = (u64, String, serde_json::Value);
+
 /// Build the push body: streams grouped by (service, level) labels, values
 /// sorted by timestamp (Loki requires ordering within a stream).
 fn build_body(entries: &[LogEntry]) -> serde_json::Value {
-    let mut streams: BTreeMap<(String, String), Vec<(u64, String, serde_json::Value)>> =
-        BTreeMap::new();
+    let mut streams: BTreeMap<(String, String), Vec<StreamValue>> = BTreeMap::new();
     for e in entries {
         let service = e
             .metadata
@@ -49,7 +51,10 @@ fn build_body(entries: &[LogEntry]) -> serde_json::Value {
             let mut pairs: Vec<String> = e
                 .metadata
                 .iter()
-                .filter(|(k, _)| k != "service" && k != "host" && k != "pid")
+                .filter(|(k, _)| {
+                    let k = k.as_str();
+                    k != "service" && k != "host" && k != "pid"
+                })
                 .map(|(k, v)| format!("{k}={v}"))
                 .collect();
             pairs.sort();
@@ -60,7 +65,10 @@ fn build_body(entries: &[LogEntry]) -> serde_json::Value {
             }
         };
         let metadata = serde_json::Value::Object(e.metadata.clone());
-        streams.entry(key).or_default().push((e.timestamp, line, metadata));
+        streams
+            .entry(key)
+            .or_default()
+            .push((e.timestamp, line, metadata));
     }
 
     let streams: Vec<serde_json::Value> = streams
@@ -69,9 +77,7 @@ fn build_body(entries: &[LogEntry]) -> serde_json::Value {
             values.sort_by_key(|(ts, _, _)| *ts);
             let values: Vec<serde_json::Value> = values
                 .into_iter()
-                .map(|(ts, line, meta)| {
-                    serde_json::json!([ts.to_string(), line, meta])
-                })
+                .map(|(ts, line, meta)| serde_json::json!([ts.to_string(), line, meta]))
                 .collect();
             serde_json::json!({
                 "stream": { "service": service, "level": level },
@@ -102,7 +108,10 @@ impl LokiAdapter {
             }
         }
         if let Some(key) = &config.api_key {
-            headers.push(("Authorization".to_string(), format!("Bearer {}", key.expose())));
+            headers.push((
+                "Authorization".to_string(),
+                format!("Bearer {}", key.expose()),
+            ));
         }
         Ok(Self {
             client: client_from_config(config),
@@ -119,7 +128,13 @@ impl Transport for LokiAdapter {
             .map_err(|e| TransportError::Rejected(format!("decode failed: {e}")))?;
         let body = serde_json::to_vec(&build_body(&entries))
             .map_err(|e| TransportError::Rejected(format!("serialize failed: {e}")))?;
-        request_once(&self.client, &self.url, &self.headers, "application/json", body)
+        request_once(
+            &self.client,
+            &self.url,
+            &self.headers,
+            "application/json",
+            body,
+        )
     }
 
     fn name(&self) -> &str {
@@ -136,13 +151,17 @@ mod tests {
     fn streams_group_by_service_and_level_and_sort_values() {
         let mut a = LogEntry::new(LogLevel::Info, "first");
         a.timestamp = 2_000;
-        a.metadata.insert("service".into(), serde_json::json!("svc"));
+        a.metadata
+            .insert("service".into(), serde_json::json!("svc"));
         let mut b = LogEntry::new(LogLevel::Error, "boom");
         b.timestamp = 1_000;
-        b.metadata.insert("service".into(), serde_json::json!("svc"));
+        b.metadata
+            .insert("service".into(), serde_json::json!("svc"));
         let mut other = LogEntry::new(LogLevel::Info, "other stream");
         other.timestamp = 3_000;
-        other.metadata.insert("service".into(), serde_json::json!("svc2"));
+        other
+            .metadata
+            .insert("service".into(), serde_json::json!("svc2"));
 
         let body = build_body(&[a, b, other]);
         let streams = body["streams"].as_array().unwrap();
@@ -165,6 +184,6 @@ mod tests {
             metadata: Default::default(),
         };
         let body = build_body(&[e]);
-        assert_eq!(body["streams"][0]["values"][0][2]["service"], "unknown");
+        assert_eq!(body["streams"][0]["stream"]["service"], "unknown");
     }
 }

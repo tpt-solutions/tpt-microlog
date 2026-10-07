@@ -131,6 +131,24 @@ void tpt_log_destroy(tpt_log_handle* handle);
 /** Entries still buffered in the ingestion queue. */
 size_t tpt_log_queued(tpt_log_handle* handle);
 
+/**
+ * Diagnostics callback: delivery failures, WAL problems, worker panics and
+ * config warnings arrive here instead of stderr. `kind` is one of "delivery",
+ * "wal", "worker", "config". Strings are valid only during the call, which may
+ * happen on a background thread.
+ */
+typedef void (*tpt_log_error_callback)(const char* kind, const char* message, void* user);
+
+/** Install (or clear, with NULL) the process-wide diagnostics callback. */
+void tpt_log_set_error_callback(tpt_log_error_callback callback, void* user);
+
+/**
+ * Create a logger from a TOML document with the same keys as tpt-log.toml
+ * (including redact_keys / redact_patterns / redact_builtin). NULL on error;
+ * see tpt_log_last_error().
+ */
+tpt_log_handle* tpt_log_create_from_toml(const char* toml);
+
 /** Library version string (static, valid for the program lifetime). */
 const char* tpt_log_version(void);
 

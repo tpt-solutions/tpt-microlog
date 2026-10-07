@@ -7,7 +7,9 @@
     "type": "git",
     "url": "https://github.com/tpt-solutions/tpt-microlog"
   },
-  "authors": ["TPT Solutions"],
+  "authors": [
+    "TPT Solutions"
+  ],
   "keywords": [
     "logging",
     "metrics",
@@ -34,10 +36,26 @@
   "files": [
     "dist",
     "index.d.ts",
+    "pino.js",
+    "pino.d.ts",
     "README.md",
     "CHANGELOG.md"
   ],
   "engines": {
     "node": ">=18"
+  },
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./dist/tpt_log_wasm.js",
+      "default": "./dist/tpt_log_wasm.js"
+    },
+    "./pino": {
+      "types": "./pino.d.ts",
+      "import": "./pino.js",
+      "default": "./pino.js"
+    },
+    "./dist/*": "./dist/*",
+    "./package.json": "./package.json"
   }
 }

@@ -2,6 +2,7 @@
 name = "tpt-log-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
@@ -24,9 +25,15 @@ base64 = { workspace = true }
 rand = { workspace = true }
 hostname = { workspace = true }
 regex = { workspace = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"], optional = true }
+log = { version = "0.4", features = ["std"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
 
 [features]
 test-utils = []
+# `tracing` Layer and `log` facade backend (see `integrations`).
+tracing = ["dep:tracing", "dep:tracing-subscriber"]
+log = ["dep:log"]

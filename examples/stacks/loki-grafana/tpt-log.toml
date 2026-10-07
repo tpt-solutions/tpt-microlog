@@ -1,0 +1,8 @@
+#:schema https://raw.githubusercontent.com/tpt-solutions/tpt-microlog/master/tpt-log-core/tpt-log.schema.json
+preset = "grafana-loki"        # backend = "loki", endpoint = http://localhost:3100
+service = "demo-app"
+batch_size = 20
+flush_interval_ms = 1000
+
+# Grafana Cloud / authenticated Loki: send credentials as a header.
+# extra_headers = ["Authorization=Basic <base64 user:token>"]

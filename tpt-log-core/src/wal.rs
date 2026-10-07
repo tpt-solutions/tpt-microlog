@@ -152,8 +152,8 @@ pub struct Wal {
     seq: AtomicU32,
     /// O(1) running total of pending WAL bytes (guarded by `lock` writes).
     total_bytes: AtomicU64,
-    /// Holds the OS-level advisory lock for the lifetime of this instance.
-    _lock_file: std::fs::File,
+    /// Holds the OS-level advisory lock until [`Wal::release_lock`] or drop.
+    lock_file: Mutex<Option<std::fs::File>>,
 }
 
 impl Wal {
@@ -184,8 +184,17 @@ impl Wal {
             lock: Mutex::new(()),
             seq: AtomicU32::new(0),
             total_bytes: AtomicU64::new(total),
-            _lock_file: lock_file,
+            lock_file: Mutex::new(Some(lock_file)),
         })
+    }
+
+    /// Release the directory lock early so another instance (e.g. a logger
+    /// recreated after `shutdown()`) can open the same WAL. Call only once
+    /// nothing will write through this instance again. Idempotent.
+    pub fn release_lock(&self) {
+        if let Some(file) = self.lock_file.lock().take() {
+            let _ = file.unlock();
+        }
     }
 
     fn new_path(&self) -> PathBuf {
@@ -305,6 +314,13 @@ impl Wal {
         if attempts >= max_replays.max(1) {
             // Moved out of the pending set; stop counting its bytes.
             self.total_bytes.fetch_sub(size, Ordering::Relaxed);
+            crate::diag::report(
+                "wal",
+                &format!(
+                    "batch dead-lettered after {attempts} failed replays (kept for inspection): {}",
+                    target.display()
+                ),
+            );
         }
         Ok(target)
     }
@@ -358,6 +374,7 @@ impl Wal {
 
     fn enforce_cap_locked(&self) {
         // Delete oldest (FIFO) until the total size is under `max_size`.
+        let (mut dropped_files, mut dropped_bytes) = (0u64, 0u64);
         while self.total_bytes.load(Ordering::Relaxed) > self.max_size {
             let Ok(files) = self.list_locked() else {
                 break;
@@ -368,9 +385,21 @@ impl Wal {
             let size = std::fs::metadata(oldest).map(|m| m.len()).unwrap_or(0);
             if std::fs::remove_file(oldest).is_ok() {
                 self.total_bytes.fetch_sub(size, Ordering::Relaxed);
+                dropped_files += 1;
+                dropped_bytes += size;
             } else {
                 break; // avoid spinning on an undeletable file
             }
+        }
+        if dropped_files > 0 {
+            // Undelivered data is being discarded: never do that silently.
+            crate::diag::report(
+                "wal",
+                &format!(
+                    "WAL over its {} byte cap: discarded the {dropped_files} oldest undelivered batch(es) ({dropped_bytes} bytes)",
+                    self.max_size
+                ),
+            );
         }
     }
 
@@ -417,14 +446,30 @@ fn read_frame_unlocked(path: &Path) -> std::io::Result<WalFrame> {
     Ok(frame)
 }
 
+/// Longest attempt counter accepted in a file stem. The unique suffix of a
+/// WAL file name is 8 hex characters, so a `-a<digits>` marker of at most
+/// this many digits can never be confused with a suffix that merely starts
+/// with `a` and is otherwise numeric (e.g. `…-a8125429`).
+const MAX_ATTEMPT_DIGITS: usize = 6;
+
+/// Split a stem into `(base, attempts)`; `attempts` is `None` when the stem
+/// carries no attempt marker.
+fn split_attempt(stem: &str) -> (&str, Option<u32>) {
+    if let Some((base, n)) = stem.rsplit_once("-a") {
+        if (1..=MAX_ATTEMPT_DIGITS).contains(&n.len()) && n.bytes().all(|b| b.is_ascii_digit()) {
+            if let Ok(attempts) = n.parse::<u32>() {
+                return (base, Some(attempts));
+            }
+        }
+    }
+    (stem, None)
+}
+
 /// Attempt counter carried in the file stem: `…-a3.wal` has failed 3 times.
 fn attempt_count(path: &Path) -> u32 {
     path.file_stem()
         .and_then(|s| s.to_str())
-        .and_then(|stem| {
-            stem.rsplit_once("-a")
-                .and_then(|(_, n)| n.parse::<u32>().ok())
-        })
+        .and_then(|stem| split_attempt(stem).1)
         .unwrap_or(0)
 }
 
@@ -434,15 +479,8 @@ fn with_attempt_count(path: &Path, attempts: u32) -> PathBuf {
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "batch".to_string());
-    let base = strip_attempt_suffix(&stem);
+    let base = split_attempt(&stem).0;
     path.with_file_name(format!("{base}-a{attempts}.{}", default_ext()))
-}
-
-fn strip_attempt_suffix(stem: &str) -> &str {
-    match stem.rsplit_once("-a") {
-        Some((base, n)) if n.chars().all(|c| c.is_ascii_digit()) && !n.is_empty() => base,
-        _ => stem,
-    }
 }
 
 /// Convenience wrapper around a shared `Wal`.
@@ -549,6 +587,26 @@ mod tests {
         assert!(dec.compressed);
         assert_eq!(dec.bytes, f.bytes);
         assert_eq!(dec.entry_count, 42);
+    }
+
+    /// A random unique suffix such as `a8125429` must not be mistaken for an
+    /// attempt counter (it used to dead-letter a batch on its first failure).
+    #[test]
+    fn numeric_a_prefixed_suffix_is_not_an_attempt_counter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = Wal::open(tmp.path().join("wal"), 1_000_000).unwrap();
+        let path = wal.write(&sample_batch(1)).unwrap();
+        let tricky = path.with_file_name("00000001791372245552-5656-0000-a8125429.wal");
+        std::fs::rename(&path, &tricky).unwrap();
+
+        assert_eq!(attempt_count(&tricky), 0);
+        let after_one = wal.mark_failed(&tricky, 3).unwrap();
+        assert!(
+            after_one.to_string_lossy().ends_with("-a8125429-a1.wal"),
+            "{after_one:?}"
+        );
+        assert_eq!(wal.len(), 1, "still pending, not dead-lettered");
+        assert_eq!(attempt_count(&after_one), 1);
     }
 
     #[test]
