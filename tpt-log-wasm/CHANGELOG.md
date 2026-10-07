@@ -9,6 +9,18 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed — Phase 10 adapter correctness
+
+- `backend: "datadog"` emits Datadog Logs API v2 event arrays
+  (`{message, status, timestamp, ddsource: "browser", ...attributes}`) with
+  native-style severity mapping.
+- The `pagehide` hook uses `fetch(..., { keepalive: true })` when custom
+  headers (e.g. `DD-API-KEY`) are configured — `sendBeacon` cannot set
+  headers — and `sendBeacon` otherwise.
+- The README documents the "never ship API keys in browser bundles" rule and
+  gains a full feature-parity table vs the native core.
+
+
 ### Changed — Phase 9 reliability hardening
 
 - Delivery outcomes are classified like the native core: network errors, 5xx,

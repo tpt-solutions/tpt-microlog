@@ -99,12 +99,40 @@ There is **no filesystem in the browser**, so the native WAL is unavailable and
 retries are held in memory only:
 
 - Failed batches stay buffered and are retried on the next flush tick, up to
-  `maxBuffer` entries.
-- On `pagehide`, pending entries are delivered with `navigator.sendBeacon()`,
-  which browsers keep alive during unload. The listener is removed by
-  `dispose()`.
+  `maxBuffer` entries, and are dropped after `maxRetries` attempts.
+- Delivery outcomes are classified like the native core: network errors, 5xx,
+  and 408/425/429 retry; other 4xx drop the batch immediately (it can never
+  succeed) instead of blocking every batch behind it.
+- On `pagehide`, pending entries are delivered with `navigator.sendBeacon()`;
+  when custom headers (e.g. Datadog's `DD-API-KEY`) are configured, a
+  `fetch(..., { keepalive: true })` is used instead, because `sendBeacon`
+  cannot set headers. The listener is removed by `dispose()`.
 - Entries beyond `maxBuffer` are dropped oldest-first rather than growing
   without bound.
+
+**Never ship secret API keys in browser bundles** — any key in a WASM build is
+visible to every visitor. For browsers, proxy log intake through your own
+backend (the generic `endpoint` + `headers` mode) or issue short-lived,
+scoped ingest tokens.
+
+## Feature parity vs the native core
+
+| Feature | Native | WASM |
+| --- | --- | --- |
+| Batching (count / interval) | ✓ | ✓ (`batchSize`, `flushInterval`) |
+| Delivery retry with backoff | ✓ persistent (WAL) | ✓ in-memory only |
+| Crash/offline durability | ✓ WAL replay + `wal-first` | ✗ (page reload loses the buffer) |
+| Transient/permanent error classification | ✓ | ✓ (4xx drop, 408/425/429/5xx retry) |
+| Retry cap | `max_retries` | ✓ (`maxRetries`) |
+| Level filtering | ✓ `min_level` + tags + regex | ✓ `minLevel` only |
+| Sampling | ✓ global + per-level; WARN+ never sampled | ✓ `sampleRate` (global, incl. WARN+) |
+| Enrichment (host/pid/service/env) | ✓ | `service` metadata only |
+| Compression (zstd) | ✓ (`fast_mode` to disable) | ✗ (plain JSON) |
+| Queue overflow policies | ✓ block / drop_newest / drop_oldest | drop-oldest at `maxBuffer` |
+| `metric()` | ✓ (log + optional Prometheus/Metrics API) | ✓ (log stream only) |
+| `span()` tracing | ✓ | ✓ (log stream only) |
+| `stats()` / `flush()` | ✓ synchronous | ✓ (`flush()` is a Promise) |
+| Default min level | `TRACE` (unfiltered) | `DEBUG` |
 
 ## Building
 

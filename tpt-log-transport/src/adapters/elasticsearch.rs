@@ -16,7 +16,7 @@ use base64::Engine as _;
 
 use tpt_log_core::{CompressedBatch, Config, LogEntry, Transport, TransportError};
 
-use crate::http::{pooled_client, request_once_full};
+use crate::http::{client_from_config, request_once_full};
 
 const DEFAULT_ENDPOINT: &str = "http://localhost:9200";
 const DEFAULT_INDEX: &str = "tpt-microlog";
@@ -46,7 +46,10 @@ fn sanitize_index(raw: &str) -> String {
         .map(|c| {
             if c.is_ascii_uppercase() {
                 c.to_ascii_lowercase()
-            } else if matches!(c, '\\' | '/' | '*' | '?' | '"' | '<' | '>' | '|' | ',' | '#' | ' ') {
+            } else if matches!(
+                c,
+                '\\' | '/' | '*' | '?' | '"' | '<' | '>' | '|' | ',' | '#' | ' '
+            ) {
                 '_'
             } else {
                 c
@@ -66,7 +69,10 @@ fn sanitize_index(raw: &str) -> String {
 /// Flatten one entry into a searchable document object.
 fn to_doc(entry: &LogEntry) -> serde_json::Value {
     let mut doc = serde_json::Map::new();
-    doc.insert("@timestamp".into(), serde_json::Value::from(entry.timestamp));
+    doc.insert(
+        "@timestamp".into(),
+        serde_json::Value::from(entry.timestamp),
+    );
     doc.insert(
         "level".into(),
         serde_json::Value::String(entry.level.to_string().to_ascii_lowercase()),
@@ -139,12 +145,7 @@ impl ElasticsearchAdapter {
             .clone()
             .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
         let url = format!("{}/_bulk", base.trim_end_matches('/'));
-        let index = sanitize_index(
-            config
-                .es_index
-                .as_deref()
-                .unwrap_or(DEFAULT_INDEX),
-        );
+        let index = sanitize_index(config.es_index.as_deref().unwrap_or(DEFAULT_INDEX));
         let mut headers = Vec::new();
         for raw in &config.extra_headers {
             match raw.split_once('=') {
@@ -157,7 +158,10 @@ impl ElasticsearchAdapter {
             }
         }
         if let Some(key) = &config.api_key {
-            headers.push(("Authorization".to_string(), format!("ApiKey {}", key.expose())));
+            headers.push((
+                "Authorization".to_string(),
+                format!("ApiKey {}", key.expose()),
+            ));
         }
         if let Some(auth) = &config.es_basic_auth {
             headers.push((
@@ -166,7 +170,7 @@ impl ElasticsearchAdapter {
             ));
         }
         Ok(Self {
-            client: pooled_client(),
+            client: client_from_config(config),
             url,
             headers,
             index,

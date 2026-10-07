@@ -9,6 +9,14 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed — Phase 10 adapter correctness
+
+- Constructor gained the adapter-correctness options: `datadog_site`,
+  `datadog_metrics`, `es_index`, `es_basic_auth`, `aws_session_token`,
+  `aws_auto_create_stream`, `body_mode` (validated `"json"`/`"zstd"`), and
+  `tcp_ack`.
+
+
 ### Changed — Phase 9 reliability hardening
 
 - Blocking calls (`shutdown`, `flush`, constructor) release the GIL while the

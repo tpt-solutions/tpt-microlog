@@ -16,12 +16,11 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
 
 use tpt_log_core::{CompressedBatch, Config, LogEntry, Transport, TransportError};
 
 use crate::adapters::sigv4::{self, Credentials};
-use crate::http::{pooled_client, request_once};
+use crate::http::{client_from_config, request_once};
 
 const SERVICE: &str = "logs";
 /// PutLogEvents: max 10 000 events per call.
@@ -132,7 +131,7 @@ impl CloudWatchAdapter {
             .to_string();
 
         Ok(Self {
-            client: pooled_client(),
+            client: client_from_config(config),
             url,
             host: hostname,
             creds: Credentials {
@@ -157,7 +156,8 @@ impl CloudWatchAdapter {
         if let Some(token) = &self.session_token {
             extra.insert("x-amz-security-token".into(), token.clone());
         }
-        let (auth, amz_date) = sigv4::sign(&self.creds, SERVICE, "POST", &self.host, "/", &extra, body);
+        let (auth, amz_date) =
+            sigv4::sign(&self.creds, SERVICE, "POST", &self.host, "/", &extra, body);
 
         let mut headers = vec![
             ("authorization".to_string(), auth),
@@ -171,7 +171,13 @@ impl CloudWatchAdapter {
         if let Some(token) = &self.session_token {
             headers.push(("x-amz-security-token".to_string(), token.clone()));
         }
-        request_once(&self.client, &self.url, &headers, "application/x-amz-json-1.1", body.to_vec())
+        request_once(
+            &self.client,
+            &self.url,
+            &headers,
+            "application/x-amz-json-1.1",
+            body.to_vec(),
+        )
     }
 
     /// Create the log group/stream when `aws_auto_create_stream` is set.
@@ -228,8 +234,7 @@ impl CloudWatchAdapter {
         for event in events {
             let approx = serde_json::to_string(&event).map(|s| s.len()).unwrap_or(0) + 1;
             if !current.is_empty()
-                && (current.len() >= MAX_EVENTS_PER_CALL
-                    || current_bytes + approx > MAX_BODY_BYTES)
+                && (current.len() >= MAX_EVENTS_PER_CALL || current_bytes + approx > MAX_BODY_BYTES)
             {
                 chunks.push(std::mem::take(&mut current));
                 current_bytes = 0;
@@ -302,11 +307,13 @@ mod tests {
     #[test]
     fn build_body_shape() {
         let adapter = CloudWatchAdapter::from_config(&test_config()).unwrap();
-        let events = adapter.chunk_events(&[entry(42, "hi")]);
+        // A recent timestamp (the 14-day filter drops 1970-era stamps).
+        let now = (adapter.now_ms)();
+        let events = adapter.chunk_events(&[entry(now, "hi")]);
         let body = adapter.build_body(&events[0]);
         assert_eq!(body["logGroupName"], "group");
         assert_eq!(body["logStreamName"], "stream");
-        assert_eq!(body["logEvents"][0]["timestamp"], 42);
+        assert_eq!(body["logEvents"][0]["timestamp"], now);
         assert_eq!(body["logEvents"][0]["message"], "hi");
     }
 
@@ -345,13 +352,13 @@ mod tests {
     #[test]
     fn events_are_sorted_metadata_inlined_and_old_events_dropped() {
         let adapter = CloudWatchAdapter::from_config(&test_config()).unwrap();
-        let mut e1 = entry(200, "second");
+        let now = (adapter.now_ms)();
+        let mut e1 = entry(now - 500, "second");
         e1.metadata.insert("user".into(), serde_json::json!("bob"));
         e1.metadata.insert("n".into(), serde_json::json!(3));
-        let mut ancient = entry(10, "ancient");
-        // Age relative to the adapter's clock (fixed in tests for determinism).
-        ancient.timestamp = (adapter.now_ms)().saturating_sub(MAX_AGE_MS + 1);
-        let e0 = entry(100, "first");
+        let mut ancient = entry(0, "ancient");
+        ancient.timestamp = now.saturating_sub(MAX_AGE_MS + 1);
+        let e0 = entry(now - 1_000, "first");
 
         let chunks = adapter.chunk_events(&[e1, ancient, e0]);
         assert_eq!(chunks.len(), 1, "ancient event is filtered, rest fits");
@@ -359,8 +366,7 @@ mod tests {
         assert_eq!(events.len(), 2, "the 14-day-old event must be skipped");
         assert_eq!(events[0]["message"], "first");
         assert_eq!(
-            events[1]["message"],
-            "second n=3 user=\"bob\"",
+            events[1]["message"], "second n=3 user=\"bob\"",
             "metadata inlined as sorted key=value pairs"
         );
     }
@@ -368,15 +374,22 @@ mod tests {
     #[test]
     fn oversized_batches_split_at_count_and_byte_limits() {
         let adapter = CloudWatchAdapter::from_config(&test_config()).unwrap();
+        let now = (adapter.now_ms)();
         // > 10k events → more than one call.
-        let many: Vec<LogEntry> = (0..10_500).map(|i| entry(i as u64, "e")).collect();
+        let many: Vec<LogEntry> = (0..10_500u64).map(|i| entry(now + i, "e")).collect();
         assert_eq!(adapter.chunk_events(&many).len(), 2);
 
         // > ~1 MB of message text → more than one call.
         let big_message = "x".repeat(2_000);
-        let heavy: Vec<LogEntry> = (0..1_000).map(|i| entry(i as u64, &big_message)).collect();
+        let heavy: Vec<LogEntry> = (0..1_000u64)
+            .map(|i| entry(now + i, &big_message))
+            .collect();
         let chunks = adapter.chunk_events(&heavy);
-        assert!(chunks.len() >= 2, "1 MB budget must split: {}", chunks.len());
+        assert!(
+            chunks.len() >= 2,
+            "1 MB budget must split: {}",
+            chunks.len()
+        );
         assert!(chunks[0].len() >= 400, "first chunk should be near-full");
     }
 

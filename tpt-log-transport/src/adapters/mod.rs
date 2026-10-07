@@ -8,8 +8,11 @@
 pub mod cloudwatch;
 pub mod datadog;
 pub mod elasticsearch;
+pub mod loki;
+pub mod otlp_http;
 pub mod prometheus;
 pub mod sigv4;
+pub mod splunk;
 
 /// Shared formatting helper: build the `{"...": value}` object for a metric
 /// entry's numeric `metadata["value"]`.

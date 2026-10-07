@@ -7,6 +7,17 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ## [Unreleased]
 
+### Changed — Phase 10 adapter correctness
+
+- New config knobs: `body_mode` (`json` default | `zstd` opt-in for the
+  generic HTTP backend), `datadog_site` + `datadog_metrics`, `es_index` +
+  `es_basic_auth`, `aws_session_token` + `aws_auto_create_stream`, and
+  `tcp_ack`; all exposed via `tpt-log.toml` and the corresponding
+  `TPT_LOG_*` environment variables.
+- `Config::resolved_aws_credentials()` implements the standard `AWS_*`
+  environment-variable credential chain for the CloudWatch adapter.
+
+
 ### Changed — Phase 9 reliability hardening
 
 - **WAL**: per-identity namespace directories (hash of service+backend+endpoint)

@@ -60,6 +60,8 @@ struct Inner {
     max_retries_kept: usize,
     /// Attempts a batch may stay buffered during outages before it is dropped.
     max_retries: u32,
+    /// Emit Datadog Logs-API-v2 event arrays instead of `{"entries": [...]}`.
+    datadog: bool,
     timer: RefCell<Option<Closure<dyn FnMut()>>>,
     unload: RefCell<Option<Closure<dyn FnMut()>>>,
     stopped: RefCell<bool>,
@@ -102,6 +104,18 @@ impl Inner {
         }
     }
 
+    /// Encode a batch in the wire format of the configured backend:
+    /// `{"entries": [...]}` by default, or a Datadog Logs API v2 event array
+    /// (`[{message, status, timestamp, ddsource, ...attributes}]`).
+    fn encode_batch(&self, batch: &[Entry]) -> Vec<u8> {
+        if self.datadog {
+            let events: Vec<serde_json::Value> = batch.iter().map(dd_event).collect();
+            serde_json::to_vec(&events).unwrap_or_default()
+        } else {
+            serde_json::to_vec(&serde_json::json!({ "entries": batch })).unwrap_or_default()
+        }
+    }
+
     /// Put a failed batch back, bounded by `max_retries_kept` (drop oldest).
     fn requeue(&self, batch: Vec<Entry>) {
         let mut buffer = self.buffer.borrow_mut();
@@ -139,10 +153,9 @@ impl Inner {
         if batch.is_empty() {
             return;
         }
-        let body =
-            serde_json::to_vec(&serde_json::json!({ "entries": &batch })).unwrap_or_default();
+        let body = self.encode_batch(&batch);
         let endpoint = self.endpoint.as_deref().unwrap_or_default();
-        match send_batch(endpoint, &self.headers, &body).await {
+        match send_batch(endpoint, &self.headers, &body, false).await {
             SendOutcome::Delivered => {
                 self.delivered_entries
                     .set(self.delivered_entries.get() + batch.len() as u32);
@@ -168,6 +181,45 @@ impl Inner {
     }
 }
 
+/// Map one entry to a Datadog v2 log event: metadata becomes top-level
+/// attributes, severity uses Datadog's `status` vocabulary.
+fn dd_event(entry: &Entry) -> serde_json::Value {
+    let status = match entry.level.to_ascii_uppercase().as_str() {
+        "TRACE" | "DEBUG" => "debug",
+        "INFO" => "info",
+        "WARN" => "warning",
+        "ERROR" => "error",
+        _ => "critical",
+    };
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "message".into(),
+        serde_json::Value::String(entry.message.clone()),
+    );
+    obj.insert("status".into(), serde_json::Value::String(status.into()));
+    obj.insert("timestamp".into(), serde_json::Value::from(entry.timestamp));
+    obj.insert(
+        "ddsource".into(),
+        serde_json::Value::String("browser".into()),
+    );
+    for (k, v) in &entry.metadata {
+        if matches!(
+            k.as_str(),
+            "host" | "service" | "source" | "pid" | "value" | "tags"
+        ) {
+            continue;
+        }
+        obj.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+    if let Some(service) = entry.metadata.get("service") {
+        obj.insert("service".into(), service.clone());
+    }
+    if let Some(tags) = entry.metadata.get("tags").filter(|t| t.is_object()) {
+        obj.insert("tags".into(), tags.clone());
+    }
+    serde_json::Value::Object(obj)
+}
+
 /// Result of one delivery attempt, classified like the native core.
 enum SendOutcome {
     Delivered,
@@ -177,8 +229,14 @@ enum SendOutcome {
     Permanent,
 }
 
-/// POST one batch via `fetch` and classify the response status.
-async fn send_batch(endpoint: &str, headers: &[(String, String)], body: &[u8]) -> SendOutcome {
+/// POST one batch via `fetch` and classify the response status. With
+/// `keepalive`, the request survives page unload (used by the pagehide hook).
+async fn send_batch(
+    endpoint: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    keepalive: bool,
+) -> SendOutcome {
     let global = js_sys::global();
     let fetch: Function = match js_sys::Reflect::get(&global, &"fetch".into()) {
         Ok(f) if f.is_function() => f.unchecked_into(),
@@ -193,6 +251,11 @@ async fn send_batch(endpoint: &str, headers: &[(String, String)], body: &[u8]) -
 
     let init = web_sys::RequestInit::new();
     init.set_method("POST");
+    // web-sys does not generate a `keepalive` setter; it is a plain
+    // dictionary property, so set it via reflection.
+    if keepalive {
+        let _ = js_sys::Reflect::set(init.as_ref(), &"keepalive".into(), &JsValue::from(true));
+    }
     let bytes = js_sys::Uint8Array::from(body);
     init.set_body(&bytes.into());
     let request = match web_sys::Request::new_with_str_and_init(endpoint, &init) {
@@ -331,6 +394,7 @@ impl MicroLog {
     /// - `sampleRate` — fraction of entries kept, 0.0–1.0 (default 1.0)
     /// - `maxBuffer` — cap on buffered entries during outages (default 10 000)
     /// - `maxRetries` — attempts before a transiently-failing batch is dropped (default 10)
+    /// - `backend = "datadog"` — emit Datadog Logs API v2 event arrays (pair with `apiKey`)
     #[wasm_bindgen(constructor)]
     pub fn new(options: JsValue) -> MicroLog {
         let backend = option_str(&options, "backend").unwrap_or_default();
@@ -345,6 +409,9 @@ impl MicroLog {
             .and_then(level_rank)
             .unwrap_or(1); // DEBUG
         let endpoint = option_str(&options, "endpoint").filter(|s| !s.is_empty());
+        let datadog = option_str(&options, "backend")
+            .map(|b| b.eq_ignore_ascii_case("datadog"))
+            .unwrap_or(false);
 
         let inner = Rc::new(Inner {
             buffer: RefCell::new(Vec::new()),
@@ -357,6 +424,7 @@ impl MicroLog {
             flush_interval_ms: (option_f64(&options, "flushInterval", 2.0) * 1000.0).max(50.0),
             max_retries_kept: option_f64(&options, "maxBuffer", 10_000.0).max(1.0) as usize,
             max_retries: option_f64(&options, "maxRetries", 10.0).max(1.0) as u32,
+            datadog,
             timer: RefCell::new(None),
             unload: RefCell::new(None),
             stopped: RefCell::new(false),
@@ -393,17 +461,29 @@ impl MicroLog {
         *self.inner.timer.borrow_mut() = Some(closure);
     }
 
-    /// Last-ditch delivery when the page goes away.
+    /// Last-ditch delivery when the page goes away. `sendBeacon` cannot set
+    /// request headers, so when custom headers (or Datadog's DD-API-KEY) are
+    /// configured, a `fetch(..., { keepalive: true })` is used instead — the
+    /// browser completes it even during page teardown.
     fn register_unload(&self) {
         let Some(window) = web_sys::window() else {
             return;
         };
         let state = Rc::clone(&self.inner);
         let closure = Closure::wrap(Box::new(move || {
-            if let Some(body) = state.pending_json() {
-                if let Some(endpoint) = &state.endpoint {
-                    send_beacon(endpoint, &body);
-                }
+            let Some(endpoint) = state.endpoint.clone() else {
+                return;
+            };
+            let Some(body) = state.pending_json() else {
+                return;
+            };
+            if state.headers.is_empty() {
+                send_beacon(&endpoint, &body);
+            } else {
+                let headers = state.headers.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    let _ = send_batch(&endpoint, &headers, &body, true).await;
+                });
             }
         }) as Box<dyn FnMut()>);
         let _ =

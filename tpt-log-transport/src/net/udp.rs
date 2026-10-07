@@ -74,8 +74,13 @@ impl Transport for UdpTransport {
         };
         let batch_id = self.next_batch_id.fetch_add(1, Ordering::Relaxed);
         let max_chunk = MAX_DATAGRAM_BYTES - HEADER_LEN;
-        let chunk_count = payload.len().div_ceil(max_chunk).max(1);
-        for (index, chunk) in payload.chunks(max_chunk).chain(std::iter::repeat(&[] as &[u8])).take(chunk_count).enumerate() {
+        let chunks: Vec<&[u8]> = if payload.is_empty() {
+            vec![&[]]
+        } else {
+            payload.chunks(max_chunk).collect()
+        };
+        let chunk_count = chunks.len();
+        for (index, chunk) in chunks.iter().enumerate() {
             let mut frame = Vec::with_capacity(HEADER_LEN + chunk.len());
             frame.extend_from_slice(FRAME_MAGIC);
             frame.extend_from_slice(&batch_id.to_be_bytes());
@@ -155,7 +160,7 @@ mod tests {
     fn frame(batch_id: u32, index: usize, chunk_count: usize, flag: u8, chunk: &[u8]) -> Vec<u8> {
         let mut frame = Vec::with_capacity(HEADER_LEN + chunk.len());
         frame.extend_from_slice(FRAME_MAGIC);
-        frame.extend_from_slice(&(batch_id as u32).to_be_bytes());
+        frame.extend_from_slice(&batch_id.to_be_bytes());
         frame.extend_from_slice(&(index as u16).to_be_bytes());
         frame.extend_from_slice(&(chunk_count as u16).to_be_bytes());
         frame.push(flag);
@@ -219,6 +224,6 @@ mod tests {
     #[test]
     fn datagram_size_is_mtu_safe() {
         // A full chunk plus the header must fit a standard MTU datagram.
-        assert!(MAX_DATAGRAM_BYTES <= 1_400, "{MAX_DATAGRAM_BYTES}");
+        const { assert!(MAX_DATAGRAM_BYTES <= 1_400) };
     }
 }

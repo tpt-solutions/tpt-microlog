@@ -182,6 +182,107 @@ fn cloudwatch_adapter_signs_put_log_events() {
     assert_eq!(value["logEvents"][0]["message"], "hello aws");
 }
 
+/// The generic HTTP backend posts plain JSON by default (no content-encoding);
+/// zstd bodies are opt-in via `body_mode`.
+#[test]
+fn http_backend_posts_plain_json_by_default_and_zstd_optin() {
+    let mock = Mock::start();
+    let cfg = slim_config("http", &mock.addr);
+    let transport = build_transport(&cfg).unwrap();
+    let log = MicroLog::new(cfg, Arc::from(transport));
+    log.info("plain json");
+    log.shutdown();
+
+    assert!(!mock.head().contains("content-encoding"), "default is JSON");
+    let value: serde_json::Value = serde_json::from_slice(&mock.body().unwrap()).unwrap();
+    assert_eq!(value["entries"][0]["message"], "plain json");
+
+    let mock2 = Mock::start();
+    let cfg2 = Config {
+        body_mode: tpt_log_core::BodyMode::Zstd,
+        ..slim_config("http", &mock2.addr)
+    };
+    let transport2 = build_transport(&cfg2).unwrap();
+    let log2 = MicroLog::new(cfg2, Arc::from(transport2));
+    log2.info("compressed");
+    log2.shutdown();
+    assert!(mock2.head().contains("content-encoding: zstd"));
+}
+
+/// Datadog requests split at the 1000-event intake cap.
+#[test]
+fn datadog_splits_requests_at_event_cap() {
+    use tpt_log_transport::adapters::datadog::DatadogAdapter;
+
+    let mock = Mock::start();
+    let cfg = Config {
+        api_key: Some(tpt_log_core::Secret::new("k")),
+        ..slim_config("datadog", &mock.addr)
+    };
+    let adapter = DatadogAdapter::from_config(&cfg).unwrap();
+    let entries: Vec<tpt_log_core::LogEntry> = (0..1_500u64)
+        .map(|i| tpt_log_core::LogEntry {
+            timestamp: 1_700_000_000_000 + i,
+            level: tpt_log_core::LogLevel::Info,
+            log_type: tpt_log_core::LogType::Log,
+            message: format!("split-{i}"),
+            metadata: Default::default(),
+        })
+        .collect();
+    let batch = tpt_log_core::Compressor::new(0, true)
+        .compress_batch(&tpt_log_core::Batch { entries }, 1_500);
+    adapter.send(&batch).unwrap();
+
+    assert_eq!(mock.request_count(), 2, "1500 events must split into 2");
+    let bodies = mock.bodies.lock().unwrap();
+    let first: serde_json::Value = serde_json::from_slice(&bodies[0]).unwrap();
+    let second: serde_json::Value = serde_json::from_slice(&bodies[1]).unwrap();
+    assert_eq!(first.as_array().unwrap().len(), 1000);
+    assert_eq!(second.as_array().unwrap().len(), 500);
+}
+
+/// Elasticsearch per-item bulk errors surface even on HTTP 200; item 429 is
+/// transient (so the core retries it) while 400 is permanent.
+#[test]
+fn elasticsearch_bulk_item_errors_are_classified() {
+    use tpt_log_transport::adapters::elasticsearch::ElasticsearchAdapter;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = format!("http://{}", listener.local_addr().unwrap());
+    let body: &'static [u8] = br#"{"errors":true,"items":[{"index":{"status":429,"error":{"type":"es_rejected_execution_exception","reason":"too many requests"}}}]}"#;
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 4096];
+            let _ = std::io::Read::read(&mut stream, &mut buf);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            use std::io::Write as _;
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(body);
+        }
+    });
+
+    let cfg = slim_config("elasticsearch", &addr);
+    let adapter = ElasticsearchAdapter::from_config(&cfg).unwrap();
+    let entries = vec![tpt_log_core::LogEntry::new(
+        tpt_log_core::LogLevel::Info,
+        "rejected",
+    )];
+    let batch = tpt_log_core::Compressor::new(0, true).compress_batch(
+        &tpt_log_core::Batch {
+            entries: entries.clone(),
+        },
+        1,
+    );
+    let err = adapter.send(&batch).unwrap_err();
+    assert!(
+        matches!(err, tpt_log_core::TransportError::RateLimited { .. }),
+        "item 429 must be transient: {err}"
+    );
+}
+
 /// Prometheus adapter serves `log.metric(...)` samples on `/metrics`.
 #[test]
 fn prometheus_adapter_serves_metrics_via_pull() {

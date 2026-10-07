@@ -10,11 +10,12 @@
 //! ~5 MB per request. With `datadog_metrics = true`, `metric()` entries are
 //! additionally shipped through the Metrics API (`/api/v2/series`).
 
-use tpt_log_core::{CompressedBatch, Config, LogEntry, LogLevel, LogType, Transport, TransportError};
+use tpt_log_core::{
+    CompressedBatch, Config, LogEntry, LogLevel, LogType, Transport, TransportError,
+};
 
-use crate::http::{pooled_client, request_once, request_once_full};
+use crate::http::{client_from_config, request_once};
 
-const DEFAULT_ENDPOINT: &str = "https://http-intake.logs.datadoghq.com/api/v2/logs";
 const DEFAULT_SITE: &str = "datadoghq.com";
 /// Datadog intake caps a logs request at 1000 events.
 const MAX_EVENTS_PER_REQUEST: usize = 1_000;
@@ -86,8 +87,7 @@ fn to_dd_event(entry: &LogEntry) -> serde_json::Value {
         if RESERVED_KEYS.contains(&k.as_str()) && k != "tags" {
             continue;
         }
-        obj.entry(k.clone())
-            .or_insert_with(|| v.clone());
+        obj.entry(k.clone()).or_insert_with(|| v.clone());
     }
     serde_json::Value::Object(obj)
 }
@@ -159,10 +159,7 @@ impl DatadogAdapter {
 
         let site = config.datadog_site.as_deref().unwrap_or(DEFAULT_SITE);
         let default_intake = format!("https://http-intake.logs.{site}/api/v2/logs");
-        let url = config
-            .endpoint
-            .clone()
-            .unwrap_or(default_intake);
+        let url = config.endpoint.clone().unwrap_or(default_intake);
 
         // Metrics API base: derive from an explicitly overridden endpoint by
         // replacing the path, else from the site (api.<site>/api/v2/series).
@@ -190,7 +187,7 @@ impl DatadogAdapter {
             }
         }
         Ok(Self {
-            client: pooled_client(),
+            client: client_from_config(config),
             url,
             metrics_url,
             headers,
@@ -242,7 +239,13 @@ impl Transport for DatadogAdapter {
             if !series.is_empty() {
                 let body = serde_json::to_vec(&serde_json::json!({ "series": series }))
                     .map_err(|e| TransportError::Rejected(format!("serialize failed: {e}")))?;
-                request_once(&self.client, metrics_url, &self.headers, "application/json", body)?;
+                request_once(
+                    &self.client,
+                    metrics_url,
+                    &self.headers,
+                    "application/json",
+                    body,
+                )?;
             }
         }
 
@@ -277,7 +280,7 @@ mod tests {
 
     #[test]
     fn chunks_respect_event_count_and_body_budget() {
-        let small: Vec<serde_json::Value> = (0..2_500).map(|i| event("m", 0 + (i % 10))).collect();
+        let small: Vec<serde_json::Value> = (0..2_500).map(|i| event("m", i % 10)).collect();
         let chunks = DatadogAdapter::chunk_entries(&small);
         assert_eq!(chunks.len(), 3, "2500 events must split into 3 requests");
         assert!(chunks.iter().all(|c| c.len() <= MAX_EVENTS_PER_REQUEST));
@@ -302,7 +305,10 @@ mod tests {
             adapter.url,
             "https://http-intake.logs.datadoghq.eu/api/v2/logs"
         );
-        assert_eq!(adapter.metrics_url.as_deref(), Some("https://api.datadoghq.eu/api/v2/series"));
+        assert_eq!(
+            adapter.metrics_url.as_deref(),
+            Some("https://api.datadoghq.eu/api/v2/series")
+        );
     }
 
     #[test]

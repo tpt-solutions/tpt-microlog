@@ -157,17 +157,17 @@
 
 ## Phase 10 — Adapter Correctness
 
-- [ ] HTTP/custom backend: default to plain JSON body; zstd/gzip opt-in
-- [ ] Prometheus: key samples by name + label set; escape label values; sanitize label keys; one `# TYPE` per metric; stoppable listener
-- [ ] Datadog: send metadata as top-level attributes (not `ddtags`); `site` option; split requests at 1000 entries / 5 MB; optional Metrics API for `metric()`
-- [ ] Elasticsearch: sane default index (not hostname, lowercase); parse bulk `errors:true` responses; basic-auth / API-key options; retry on 429
-- [ ] CloudWatch: include metadata in message; sort events by timestamp; enforce 10k events / 1 MB / 14-day limits; session token + env/IAM credentials; optional auto-create group/stream
-- [ ] UDP: add batch id to frame header; correct compressed flag; MTU-safe chunk size (~1200-1400 B)
-- [ ] TCP: write timeout; compressed flag in frame; optional ack; remove `expect` panics
-- [ ] WASM: distinguish transient/permanent errors, cap retries (fix 4xx head-of-line blocking)
-- [ ] WASM: use `fetch(..., { keepalive: true })` instead of `sendBeacon` when headers are needed
-- [ ] WASM: emit Datadog-format payload for `backend: "datadog"`; document "never ship API keys in browser bundles"
-- [ ] WASM: publish feature-parity table vs native (filters, enrichment, compression, default min level)
+- [x] HTTP/custom backend: default to plain JSON body; zstd/gzip opt-in
+- [x] Prometheus: key samples by name + label set; escape label values; sanitize label keys; one `# TYPE` per metric; stoppable listener
+- [x] Datadog: send metadata as top-level attributes (not `ddtags`); `site` option; split requests at 1000 entries / 5 MB; optional Metrics API for `metric()`
+- [x] Elasticsearch: sane default index (not hostname, lowercase); parse bulk `errors:true` responses; basic-auth / API-key options; retry on 429
+- [x] CloudWatch: include metadata in message; sort events by timestamp; enforce 10k events / 1 MB / 14-day limits; session token + env/IAM credentials; optional auto-create group/stream
+- [x] UDP: add batch id to frame header; correct compressed flag; MTU-safe chunk size (~1200-1400 B)
+- [x] TCP: write timeout; compressed flag in frame; optional ack; remove `expect` panics
+- [x] WASM: distinguish transient/permanent errors, cap retries (fix 4xx head-of-line blocking)
+- [x] WASM: use `fetch(..., { keepalive: true })` instead of `sendBeacon` when headers are needed
+- [x] WASM: emit Datadog-format payload for `backend: "datadog"`; document "never ship API keys in browser bundles"
+- [x] WASM: publish feature-parity table vs native (filters, enrichment, compression, default min level)
 
 ## Phase 11 — Adoption & Usability
 

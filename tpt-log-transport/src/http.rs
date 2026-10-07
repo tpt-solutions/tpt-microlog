@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use tpt_log_core::{CompressedBatch, Transport, TransportError};
+use tpt_log_core::{BodyMode, CompressedBatch, Config, Transport, TransportError};
 
 /// Build a pooled blocking client with sane timeouts.
 pub(crate) fn pooled_client() -> reqwest::blocking::Client {
@@ -15,6 +15,40 @@ pub(crate) fn pooled_client() -> reqwest::blocking::Client {
         .timeout(Duration::from_secs(15))
         .build()
         .expect("reqwest client builder is valid")
+}
+
+/// Build a pooled blocking client honoring `ca_cert` (custom PEM trust bundle)
+/// and `proxy` from the config, with sane timeouts.
+pub(crate) fn client_from_config(config: &Config) -> reqwest::blocking::Client {
+    let mut builder = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15));
+    if let Some(path) = &config.ca_cert {
+        match std::fs::read(path) {
+            Ok(pem) => match reqwest::Certificate::from_pem(&pem) {
+                Ok(cert) => {
+                    builder = builder.add_root_certificate(cert);
+                }
+                Err(e) => {
+                    eprintln!("tpt-microlog: ignoring invalid CA cert {path}: {e}");
+                }
+            },
+            Err(e) => {
+                eprintln!("tpt-microlog: cannot read ca_cert {path}: {e}");
+            }
+        }
+    }
+    if let Some(proxy_url) = &config.proxy {
+        match reqwest::Proxy::all(proxy_url) {
+            Ok(proxy) => {
+                builder = builder.proxy(proxy);
+            }
+            Err(e) => {
+                eprintln!("tpt-microlog: ignoring invalid proxy '{proxy_url}': {e}");
+            }
+        }
+    }
+    builder.build().expect("reqwest client builder is valid")
 }
 
 /// Perform a single HTTP POST and classify the outcome. Used by every HTTP
@@ -32,10 +66,9 @@ pub(crate) fn request_once(
     request_once_full(client, url, headers, content_type, body).map(|_| ())
 }
 
-/// A 2xx response, for backends whose success bodies carry semantic
+/// A 2xx response body, for backends whose success bodies carry semantic
 /// information (e.g. Elasticsearch bulk `errors: true`).
 pub(crate) struct SuccessResponse {
-    pub status: u16,
     pub body: Vec<u8>,
 }
 
@@ -67,10 +100,7 @@ pub(crate) fn request_once_full(
     match status.as_u16() {
         200..=299 => {
             let body = resp.bytes().map(|b| b.to_vec()).unwrap_or_default();
-            Ok(SuccessResponse {
-                status: status.as_u16(),
-                body,
-            })
+            Ok(SuccessResponse { body })
         }
         // 408 request timeout, 425 too early, 429 too many requests: the
         // backend is alive but asked us to slow down.
@@ -105,16 +135,6 @@ fn parse_retry_after(value: &str) -> Option<u64> {
         .parse::<u64>()
         .ok()
         .map(|secs| secs.saturating_mul(1000))
-}
-
-/// How the batch is encoded in the HTTP request body.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BodyMode {
-    /// POST the reconstructed JSON batch: `{"entries":[...]}`.
-    Json,
-    /// POST the raw compressed bytes with `Content-Encoding: zstd`.
-    /// The receiver must decompress before parsing.
-    Zstd,
 }
 
 /// A pooled, blocking HTTP client transport.

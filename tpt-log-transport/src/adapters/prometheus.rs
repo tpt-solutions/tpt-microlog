@@ -51,10 +51,7 @@ impl Registry {
             })
             .unwrap_or_default();
         labels.sort();
-        self.series
-            .entry(name)
-            .or_default()
-            .insert(labels, value);
+        self.series.entry(name).or_default().insert(labels, value);
     }
 
     fn render_metrics(&self) -> Vec<u8> {
@@ -66,10 +63,8 @@ impl Registry {
                 if labels.is_empty() {
                     out.push_str(&format!("{name} {value}\n"));
                 } else {
-                    let rendered: Vec<String> = labels
-                        .iter()
-                        .map(|(k, v)| format!("{k}=\"{v}\""))
-                        .collect();
+                    let rendered: Vec<String> =
+                        labels.iter().map(|(k, v)| format!("{k}=\"{v}\"")).collect();
                     out.push_str(&format!("{name}{{{}}} {value}\n", rendered.join(",")));
                 }
             }
@@ -113,7 +108,6 @@ fn escape_label_value(raw: &str) -> String {
 /// Prometheus pull-model adapter. Serves `/metrics` on a bound TCP listener
 /// until [`PrometheusAdapter::stop`] is called (or the adapter is dropped).
 pub struct PrometheusAdapter {
-    listener: Arc<TcpListener>,
     metrics_url: String,
     registry: Arc<Mutex<Registry>>,
     stop: Arc<AtomicBool>,
@@ -156,7 +150,6 @@ impl PrometheusAdapter {
         };
 
         Ok(Self {
-            listener,
             metrics_url,
             registry,
             stop,
@@ -210,9 +203,7 @@ fn serve(listener: Arc<TcpListener>, registry: Arc<Mutex<Registry>>, stop: Arc<A
 }
 
 fn handle_connection(stream: &mut std::net::TcpStream, registry: &Arc<Mutex<Registry>>) {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .ok();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
     let Ok(raw) = stream.try_clone() else {
         return;
     };

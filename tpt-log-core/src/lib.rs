@@ -18,7 +18,7 @@ pub mod transport;
 pub mod wal;
 
 pub use batch::{Batch, CompressedBatch, Compressor};
-pub use config::{Config, Durability, QueueFullPolicy, Secret};
+pub use config::{BodyMode, Config, Durability, QueueFullPolicy, Secret};
 pub use entry::LogEntry;
 pub use level::LogLevel;
 pub use log_type::LogType;

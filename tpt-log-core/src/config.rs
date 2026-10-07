@@ -9,6 +9,10 @@ use crate::LogLevel;
 pub mod backend {
     /// No-op transport (in-memory only).
     pub const NONE: &str = "none";
+    /// Human-readable stdout (pretty on a TTY, JSON lines when piped).
+    pub const CONSOLE: &str = "console";
+    /// Send to several backends at once (or fail over through them).
+    pub const FANOUT: &str = "fanout";
     /// Generic JSON POST to a configurable endpoint.
     pub const CUSTOM_HTTP: &str = "custom";
     /// Datadog Logs API v2.
@@ -27,6 +31,12 @@ pub mod backend {
     pub const TCP: &str = "tcp";
     /// Local JSONL file.
     pub const FILE: &str = "file";
+    /// Grafana Loki HTTP push API.
+    pub const LOKI: &str = "loki";
+    /// OpenTelemetry Collector over OTLP/HTTP (JSON encoding).
+    pub const OTLP_HTTP: &str = "otlp-http";
+    /// Splunk HTTP Event Collector.
+    pub const SPLUNK_HEC: &str = "splunk";
 }
 
 /// Wrapper for credential material that never leaks through `Debug` or
@@ -308,6 +318,18 @@ pub struct Config {
     /// Ask the TCP receiver for a 1-byte ack after each frame.
     pub tcp_ack: bool,
 
+    /// Optional PEM bundle used to verify server TLS certificates.
+    pub ca_cert: Option<String>,
+    /// Optional HTTP(S) proxy URL for all network backends.
+    pub proxy: Option<String>,
+    /// Backends to route to when `backend = "fanout"`.
+    pub backends: Vec<String>,
+    /// With `backend = "fanout"`: deliver through the backends in order and
+    /// stop at the first success instead of sending to all of them.
+    pub failover: bool,
+    /// Named configuration preset applied on load (see [`Config::apply_preset`]).
+    pub preset: Option<String>,
+
     /// Flush batch at this many entries.
     pub batch_size: usize,
     /// Flush interval in milliseconds.
@@ -374,7 +396,7 @@ impl Default for Config {
         let hostname = hostname::get().ok().and_then(|h| h.into_string().ok());
         Self {
             service: hostname,
-            backend: String::from(backend::NONE),
+            backend: String::from(backend::CONSOLE),
             endpoint: None,
             api_key: None,
             extra_headers: Vec::new(),
@@ -398,6 +420,11 @@ impl Default for Config {
             es_basic_auth: None,
             body_mode: BodyMode::Json,
             tcp_ack: false,
+            ca_cert: None,
+            proxy: None,
+            backends: Vec::new(),
+            failover: false,
+            preset: None,
             batch_size: defaults::BATCH_SIZE,
             flush_interval_ms: defaults::FLUSH_INTERVAL_MS,
             memory_limit_bytes: defaults::MEMORY_LIMIT_BYTES,
@@ -477,6 +504,11 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "es_basic_auth",
     "body_mode",
     "tcp_ack",
+    "ca_cert",
+    "proxy",
+    "backends",
+    "failover",
+    "preset",
     "batch_size",
     "flush_interval_ms",
     "memory_limit_bytes",
@@ -585,15 +617,26 @@ impl Config {
             None => Self::default(),
         };
         cfg.apply_env();
+        if let Some(preset) = cfg.preset.clone() {
+            // A preset set via TPT_LOG_PRESET applies after env overrides so
+            // it can flip backends on top of a config file.
+            let _ = cfg.apply_preset(&preset);
+        }
         cfg.normalize();
         cfg
     }
 
     /// Parse from a raw TOML string. Unknown keys warn on stderr; invalid
-    /// values are returned as an error.
+    /// values are returned as an error. A `preset = "..."` key applies the
+    /// named preset before normalization.
     pub fn from_toml_str(raw: &str) -> Result<Self, toml::de::Error> {
         warn_unknown_keys(raw);
         let mut cfg = toml::from_str::<Config>(raw)?;
+        if let Some(preset) = cfg.preset.clone() {
+            if let Err(e) = cfg.apply_preset(&preset) {
+                eprintln!("tpt-microlog: {e}");
+            }
+        }
         cfg.normalize();
         Ok(cfg)
     }
@@ -742,6 +785,21 @@ impl Config {
         if let Some(v) = env("TPT_LOG_TCP_ACK") {
             self.tcp_ack = matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
         }
+        if let Some(v) = env("TPT_LOG_CA_CERT") {
+            self.ca_cert = Some(v);
+        }
+        if let Some(v) = env("TPT_LOG_PROXY") {
+            self.proxy = Some(v);
+        }
+        if let Some(v) = env("TPT_LOG_BACKENDS") {
+            self.backends = split_comma_list(&v);
+        }
+        if let Some(v) = env("TPT_LOG_FAILOVER") {
+            self.failover = matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+        }
+        if let Some(v) = env("TPT_LOG_PRESET") {
+            self.preset = Some(v);
+        }
     }
 
     /// AWS credential chain: explicit config first, then the standard
@@ -783,6 +841,151 @@ impl Config {
             .collect()
     }
 
+    /// Apply a named preset over the current config (fields the preset sets
+    /// are overwritten; everything else is kept). Unknown names return an
+    /// actionable error listing the available presets.
+    pub fn apply_preset(&mut self, name: &str) -> Result<(), String> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "dev" => {
+                self.backend = backend::CONSOLE.into();
+                self.min_level = Some("DEBUG".into());
+                self.wal_enabled = false;
+                self.flush_interval_ms = 250;
+                self.batch_size = 10;
+            }
+            "prod" => {
+                self.batch_size = 500;
+                self.flush_interval_ms = 1_000;
+                self.min_level = Some("INFO".into());
+                self.wal_enabled = true;
+                self.enrichment = true;
+                self.max_retries = 10;
+            }
+            "datadog-eu" => {
+                self.backend = backend::DATADOG.into();
+                self.datadog_site = Some("datadoghq.eu".into());
+            }
+            "elastic-cloud" => {
+                self.backend = backend::ELASTICSEARCH.into();
+                self.es_index.get_or_insert_with(|| "tpt-microlog".into());
+            }
+            "grafana-loki" => {
+                self.backend = backend::LOKI.into();
+                self.endpoint
+                    .get_or_insert_with(|| "http://localhost:3100".into());
+            }
+            "otel-collector" => {
+                self.backend = backend::GRPC.into();
+                self.grpc_endpoint
+                    .get_or_insert_with(|| "http://localhost:4317".into());
+            }
+            "cloudwatch-lambda" => {
+                self.backend = backend::CLOUDWATCH.into();
+                if self.aws_region.is_none() {
+                    self.aws_region = std::env::var("AWS_REGION")
+                        .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+                        .ok();
+                }
+                self.aws_auto_create_stream = true;
+            }
+            other => {
+                return Err(format!(
+                    "unknown preset '{other}' (available: dev, prod, datadog-eu, elastic-cloud, \
+                     grafana-loki, otel-collector, cloudwatch-lambda)"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Backend-agnostic sanity checks with actionable messages. Returns every
+    /// problem found; an empty vector means the config is ready to use.
+    pub fn validate(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        match self.backend.as_str() {
+            backend::DATADOG => {
+                if self.api_key.is_none() {
+                    problems.push(
+                        "datadog backend needs `api_key` — set it in tpt-log.toml, the \
+                         MicroLog(api_key=...) argument, or TPT_LOG_API_KEY"
+                            .into(),
+                    );
+                }
+            }
+            backend::ELASTICSEARCH => {
+                if self.api_key.is_none() && self.es_basic_auth.is_none() {
+                    problems.push(
+                        "elasticsearch backend usually needs `api_key` or `es_basic_auth` \
+                         (anonymous access only works on unsecured clusters)"
+                            .into(),
+                    );
+                }
+            }
+            backend::CLOUDWATCH => {
+                if self.aws_region.is_none() {
+                    problems.push(
+                        "cloudwatch backend needs `aws_region` (or the AWS_REGION env var)"
+                            .into(),
+                    );
+                }
+                if self.resolved_aws_credentials().is_none() {
+                    problems.push(
+                        "cloudwatch backend needs credentials: set `aws_access_key` + \
+                         `aws_secret_key`, or the AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY \
+                         env vars"
+                            .into(),
+                    );
+                }
+                if self.aws_log_group.is_none() || self.aws_log_stream.is_none() {
+                    problems.push(
+                        "cloudwatch backend needs `aws_log_group` and `aws_log_stream`".into(),
+                    );
+                }
+            }
+            backend::CUSTOM_HTTP => {
+                if self.endpoint.is_none() {
+                    problems.push(
+                        "http backend needs `endpoint` (e.g. endpoint = \"https://logs.example.com/v1\")"
+                            .into(),
+                    );
+                }
+            }
+            backend::GRPC => {
+                if self.grpc_endpoint.is_none() {
+                    problems.push(
+                        "grpc backend needs `grpc_endpoint` (host:port of an OpenTelemetry \
+                         Collector — the default receiver port is 4317)"
+                            .into(),
+                    );
+                }
+            }
+            backend::UDP | backend::TCP => {
+                if self.net_endpoint.is_none() {
+                    problems.push(format!(
+                        "{} backend needs `net_endpoint` (host:port)",
+                        self.backend
+                    ));
+                }
+            }
+            backend::FILE => {
+                if self.file_path.is_none() {
+                    problems.push("file backend needs `file_path`".into());
+                }
+            }
+            backend::FANOUT => {
+                if self.backends.is_empty() {
+                    problems.push(
+                        "fanout backend needs `backends = [\"datadog\", \"file\"]` — the \
+                         list of backend names to route to"
+                            .into(),
+                    );
+                }
+            }
+            _ => {}
+        }
+        problems
+    }
+
     fn normalize(&mut self) {
         if let Some(l) = &self.min_level {
             if l.parse::<LogLevel>().is_err() {
@@ -807,7 +1010,10 @@ impl Config {
                 Some("https://http-intake.logs.datadoghq.com/api/v2/logs".to_string())
             }
             crate::config::backend::ELASTICSEARCH => Some("http://localhost:9200".to_string()),
+            crate::config::backend::LOKI => Some("http://localhost:3100".to_string()),
+            crate::config::backend::OTLP_HTTP => Some("http://localhost:4318".to_string()),
             crate::config::backend::CLOUDWATCH => None,
+            crate::config::backend::SPLUNK_HEC => None,
             other => self.endpoint.clone().or_else(|| {
                 if other == backend::CUSTOM_HTTP {
                     self.endpoint.clone()

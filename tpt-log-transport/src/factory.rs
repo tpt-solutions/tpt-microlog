@@ -6,13 +6,13 @@
 
 use std::fmt::Write as _;
 
-use tpt_log_core::{Config, NullTransport, Transport, TransportError};
+use tpt_log_core::{BodyMode, Config, NullTransport, Transport, TransportError};
 
 use crate::adapters::cloudwatch::CloudWatchAdapter;
 use crate::adapters::datadog::DatadogAdapter;
 use crate::adapters::elasticsearch::ElasticsearchAdapter;
 use crate::adapters::prometheus::PrometheusAdapter;
-use crate::http::{BodyMode, HttpTransport};
+use crate::http::HttpTransport;
 use crate::net::file::FileTransport;
 use crate::net::grpc::GrpcTransport;
 use crate::net::tcp::TcpTransport;
@@ -70,8 +70,8 @@ impl HttpTransport {
         // bodies are opt-in (`body_mode = "zstd"`). `fast_mode` implies JSON
         // (its payloads are already uncompressed).
         let mode = match (config.body_mode, config.fast_mode) {
-            (_, true) | (tpt_log_core::BodyMode::Json, false) => BodyMode::Json,
-            (tpt_log_core::BodyMode::Zstd, false) => BodyMode::Zstd,
+            (_, true) | (BodyMode::Json, false) => BodyMode::Json,
+            (BodyMode::Zstd, false) => BodyMode::Zstd,
         };
         Ok(Self::with_mode(url, headers, mode))
     }

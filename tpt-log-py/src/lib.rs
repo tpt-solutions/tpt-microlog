@@ -129,6 +129,21 @@ mod native {
             }
             "aws_log_group" => config.aws_log_group = value.extract()?,
             "aws_log_stream" => config.aws_log_stream = value.extract()?,
+            "aws_session_token" => {
+                config.aws_session_token = value.extract::<Option<String>>()?.map(Secret::new)
+            }
+            "aws_auto_create_stream" => config.aws_auto_create_stream = value.extract()?,
+            "datadog_site" => config.datadog_site = value.extract()?,
+            "datadog_metrics" => config.datadog_metrics = value.extract()?,
+            "es_index" => config.es_index = value.extract()?,
+            "es_basic_auth" => {
+                config.es_basic_auth = value.extract::<Option<String>>()?.map(Secret::new)
+            }
+            "body_mode" => {
+                let mode: String = value.extract()?;
+                config.body_mode = mode.parse().map_err(|e: String| PyValueError::new_err(e))?;
+            }
+            "tcp_ack" => config.tcp_ack = value.extract()?,
             other => {
                 return Err(PyValueError::new_err(format!(
                     "unknown MicroLog option '{other}'"

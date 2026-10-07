@@ -14,10 +14,10 @@ pub mod http;
 pub mod net;
 
 pub use factory::build_transport;
-pub use http::{BodyMode, HttpTransport};
+pub use http::HttpTransport;
 pub use net::file::FileTransport;
 pub use net::grpc::GrpcTransport;
 pub use net::tcp::TcpTransport;
 pub use net::udp::UdpTransport;
 
-pub use tpt_log_core::{Config, Transport, TransportError};
+pub use tpt_log_core::{BodyMode, Config, Transport, TransportError};
