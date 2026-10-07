@@ -196,10 +196,10 @@
 - [x] `tpt-log.toml` gallery in `docs/` (parsed and validated by a test)
 
 ### Distribution & docs
-- [ ] Go: prebuilt static libs (linux/mac/win x amd64/arm64) as release assets + fetcher; split module to resolve registry publishing
+- [x] Go: prebuilt static libs as release assets + fetcher; module path now matches its subdirectory (`.../tpt-microlog/tpt-log-go`, tag `tpt-log-go/vX.Y.Z`). Fetcher verified end to end against a local server; the build matrix in `release.yml` is not run yet; Windows is amd64 only (no cgo toolchain for arm64)
 - [ ] Publish `tpt-log-core` / `tpt-log-transport` to crates.io
-- [ ] Release automation (release-please/cargo-dist), changelog, Sigstore signing, SBOM
-- [ ] Docs site (mdBook/Docusaurus): quickstarts, backend cookbook, "delivery guarantees explained", troubleshooting, benchmark methodology
+- [x] Release automation: `scripts/release.py` (bump + changelog roll, tested) and `release.yml` (binaries, SBOM, Sigstore signing, draft release). Workflow not run on GitHub yet
+- [x] Docs site (mdBook, `docs/book`): quickstarts, backend cookbook, "delivery guarantees explained", troubleshooting, benchmark methodology. Builds with no broken links; hosting/deployment not set up
 - [x] README: badges, corrected delivery-guarantee wording
 - [ ] README: 30-second demo GIF; registry badges once the packages are published
 - [x] `CONTRIBUTING.md` (issues only), `SECURITY.md`, `CODE_OF_CONDUCT.md`, issue forms (no PR template: PRs are not accepted), `CHANGELOG.md`
@@ -207,16 +207,16 @@
 ## Phase 12 — Differentiators (pick 2-3)
 
 - [x] PII/secret redaction (`redact` keys + regex + built-in detectors) applied before WAL and network
-- [ ] Adaptive sampling under pressure (always keep WARN+)
-- [ ] Burst dedup / rate limiting with `repeat_count`
-- [ ] Error-triggered "flight recorder" (ship buffered DEBUG context only on ERROR/FATAL)
-- [ ] Daily volume/cost budget with auto-tightening sampling
-- [ ] Automatic trace correlation (W3C `traceparent` / OTel context) + span guard/context manager
-- [ ] Self-telemetry (`queue_depth`, `wal_bytes`, `dropped`, latency) + `/healthz`
-- [ ] WAL query/inspection + redacted support bundle export
-- [ ] `tpt-microlog-agent` sidecar (UDP/Unix socket/HTTP) for languages without bindings
-- [ ] Edge/WASM extras: Cloudflare Worker/Vercel Edge build, browser error auto-capture, IndexedDB offline queue
-- [ ] Schema-aware typed events
+- [x] Adaptive sampling under pressure (always keep WARN+)
+- [x] Burst dedup / rate limiting with `repeat_count`
+- [x] Error-triggered "flight recorder" (ship buffered DEBUG context only on ERROR/FATAL)
+- [x] Daily volume/cost budget with auto-tightening sampling
+- [x] Automatic trace correlation (W3C `traceparent` / OTel context) + span guard/context manager
+- [x] Self-telemetry (`queue_depth`, `wal_bytes`, `dropped`, latency) + `/healthz`
+- [x] WAL query/inspection + redacted support bundle export
+- [x] `tpt-microlog-agent` sidecar (UDP/Unix socket/HTTP) for languages without bindings
+- [x] Edge/WASM extras: Cloudflare Worker/Vercel Edge build, browser error auto-capture, IndexedDB offline queue — logic tested under Node; real browser/edge runtimes not exercised
+- [x] Schema-aware typed events
 
 ## CI & Repo Hygiene
 

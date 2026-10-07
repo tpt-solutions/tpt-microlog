@@ -14,6 +14,14 @@ pkg/
 tpt-log-wasm/dist/
 *.wasm
 
+# Go: prebuilt native libraries fetched by cmd/fetchlib
+/tpt-lib/
+/tpt-log-go/lib/
+/tpt-log-go/tpt-lib/
+
+# mdBook output
+/docs/book/book/
+
 # WAL data
 .tpt-microlog/
 

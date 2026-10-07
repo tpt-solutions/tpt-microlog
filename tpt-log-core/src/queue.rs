@@ -42,6 +42,11 @@ impl LogQueue {
         }
     }
 
+    /// Fill level of the queue, 0.0 (empty) to 1.0 (full).
+    pub fn fill_ratio(&self) -> f64 {
+        self.len() as f64 / self.capacity as f64
+    }
+
     /// Push an entry per the configured overflow policy.
     pub fn push(&self, entry: LogEntry) -> PushOutcome {
         match self.policy {

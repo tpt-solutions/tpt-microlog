@@ -10,6 +10,7 @@ use crate::batch::{Batch, CompressedBatch};
 use crate::config::{Config, Durability};
 use crate::entry::LogEntry;
 use crate::filter::EntryProcessor;
+use crate::health::Health;
 use crate::queue::{LogQueue, PushOutcome};
 use crate::retry::{policy_from_config, retry_after_hint, RetryOutcome, RetryPolicy};
 use crate::transport::{NullTransport, SpyTransport, Transport, TransportError};
@@ -27,6 +28,45 @@ pub struct Stats {
     /// Entries rejected by the queue overflow policy (`drop_newest` /
     /// `drop_oldest`) or lost when the WAL was unavailable at shutdown.
     pub dropped_entries: AtomicU64,
+    /// Entries removed by sampling (static, adaptive or daily budget).
+    pub sampled_entries: AtomicU64,
+    /// Entries removed by `rate_limit_per_sec`.
+    pub rate_limited_entries: AtomicU64,
+    /// Entries folded into an earlier identical one (`dedup_window_ms`).
+    pub deduplicated_entries: AtomicU64,
+    /// Entries parked in the flight recorder (shipped only if an error follows).
+    pub recorded_entries: AtomicU64,
+    /// Batches given up on (permanent error or retries exhausted).
+    pub delivery_failures: AtomicU64,
+    /// Unix-ms time of the last successful / failed delivery attempt (0 = never).
+    pub last_success_ms: AtomicU64,
+    pub last_failure_ms: AtomicU64,
+    /// Latency of the last successful send, and the running sum/count for the mean.
+    pub last_latency_ms: AtomicU64,
+    pub latency_sum_ms: AtomicU64,
+    pub latency_count: AtomicU64,
+}
+
+impl Stats {
+    /// Every counter as `(name, value)`: the single source for the bindings'
+    /// `stats()` and the health endpoint.
+    pub fn counters(&self) -> Vec<(&'static str, u64)> {
+        let r = Ordering::Relaxed;
+        vec![
+            ("delivered_batches", self.delivered_batches.load(r)),
+            ("delivered_entries", self.delivered_entries.load(r)),
+            ("wal_writes", self.wal_writes.load(r)),
+            ("retried_entries", self.retried_entries.load(r)),
+            ("dropped_batches", self.dropped_batches.load(r)),
+            ("dropped_entries", self.dropped_entries.load(r)),
+            ("sampled_entries", self.sampled_entries.load(r)),
+            ("rate_limited_entries", self.rate_limited_entries.load(r)),
+            ("deduplicated_entries", self.deduplicated_entries.load(r)),
+            ("recorded_entries", self.recorded_entries.load(r)),
+            ("delivery_failures", self.delivery_failures.load(r)),
+            ("last_latency_ms", self.last_latency_ms.load(r)),
+        ]
+    }
 }
 
 /// Backpressure/dispatch channel capacity between the batcher and the single
@@ -88,19 +128,23 @@ impl DeliveryEngine {
         let mut failures: u32 = 0;
         let attempts_allowed = policy.max_attempts.max(1);
         loop {
+            let started = Instant::now();
             match self.transport.send(batch) {
                 Ok(()) => {
+                    self.record_success(started.elapsed());
                     return RetryOutcome::Delivered {
                         attempts: failures + 1,
-                    }
+                    };
                 }
                 Err(e @ TransportError::Permanent(_)) | Err(e @ TransportError::Config(_)) => {
+                    self.record_failure();
                     crate::diag::report("delivery", &format!("permanent delivery failure: {e}"));
                     return RetryOutcome::Permanent;
                 }
                 Err(err) => {
                     failures += 1;
                     if failures >= attempts_allowed {
+                        self.record_failure();
                         crate::diag::report(
                             "delivery",
                             &format!("delivery gave up after {failures} attempts: {err}"),
@@ -108,6 +152,7 @@ impl DeliveryEngine {
                         return RetryOutcome::Exhausted { attempts: failures };
                     }
                     if self.stop_requested.load(Ordering::Relaxed) {
+                        self.record_failure();
                         return RetryOutcome::Exhausted { attempts: failures };
                     }
                     // First retry waits the base delay (no off-by-one); a
@@ -120,6 +165,23 @@ impl DeliveryEngine {
                 }
             }
         }
+    }
+
+    fn record_success(&self, took: Duration) {
+        let ms = took.as_millis() as u64;
+        let s = &self.stats;
+        s.last_success_ms
+            .store(crate::entry::now_millis(), Ordering::Relaxed);
+        s.last_latency_ms.store(ms, Ordering::Relaxed);
+        s.latency_sum_ms.fetch_add(ms, Ordering::Relaxed);
+        s.latency_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_failure(&self) {
+        self.stats.delivery_failures.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .last_failure_ms
+            .store(crate::entry::now_millis(), Ordering::Relaxed);
     }
 
     fn dispatch(&self, batch: &CompressedBatch) {
@@ -427,6 +489,8 @@ struct MicroLogInner {
     detached: AtomicBool,
     shutdown_done: AtomicBool,
     stats: Arc<Stats>,
+    /// Bound address of the `/healthz` endpoint, when `health_bind` is set.
+    health_addr: Mutex<Option<std::net::SocketAddr>>,
 }
 
 impl MicroLog {
@@ -510,6 +574,34 @@ impl MicroLog {
                 &config_for_processor.redact_patterns,
                 config_for_processor.redact_builtin,
             ),
+            dedup: (config_for_processor.dedup_window_ms > 0).then(|| {
+                Arc::new(crate::governor::Dedup::new(
+                    config_for_processor.dedup_window_ms,
+                    10_000,
+                ))
+            }),
+            rate_limiter: (config_for_processor.rate_limit_per_sec > 0).then(|| {
+                Arc::new(crate::governor::RateLimiter::new(
+                    config_for_processor.rate_limit_per_sec,
+                ))
+            }),
+            adaptive_floor: config_for_processor
+                .adaptive_sampling
+                .then_some(config_for_processor.adaptive_sampling_floor),
+            budget: (config_for_processor.daily_budget_entries > 0).then(|| {
+                Arc::new(crate::governor::DailyBudget::new(
+                    config_for_processor.daily_budget_entries,
+                ))
+            }),
+            recorder: (config_for_processor.flight_recorder_size > 0).then(|| {
+                Arc::new(crate::governor::FlightRecorder::new(
+                    config_for_processor.flight_recorder_size,
+                    config_for_processor
+                        .flight_recorder_max_level
+                        .parse()
+                        .unwrap_or(LogLevel::Debug),
+                ))
+            }),
             sample_rate: config_for_processor.sample_rate,
             sample_rate_by_level,
             enrichment: if config_for_processor.enrichment {
@@ -556,6 +648,7 @@ impl MicroLog {
             detached: AtomicBool::new(false),
             shutdown_done: AtomicBool::new(false),
             stats,
+            health_addr: Mutex::new(None),
         });
 
         // Delivery worker (supervised against panics). Spawned after `inner`
@@ -584,7 +677,22 @@ impl MicroLog {
             *slot.exit_rx.lock() = batcher.exit_rx.lock().take();
         }
 
+        if let Some(bind) = inner.config.health_bind.clone() {
+            health_server::spawn(&inner, &bind);
+        }
+
         MicroLog { inner }
+    }
+
+    /// Point-in-time health: queue depth, WAL backlog, delivery latency and a
+    /// coarse status. Cheap enough to poll.
+    pub fn health(&self) -> Health {
+        self.inner.health()
+    }
+
+    /// Address the `/healthz` endpoint is listening on (`health_bind`).
+    pub fn health_addr(&self) -> Option<std::net::SocketAddr> {
+        *self.inner.health_addr.lock()
     }
 
     /// Build a logger with "none" backend (in-memory discard).
@@ -666,12 +774,54 @@ impl MicroLog {
         if inner.detached.load(Ordering::Relaxed) {
             return;
         }
-        if inner.processor.process(&mut entry) {
-            match inner.queue.push(entry) {
-                PushOutcome::Accepted => {}
-                PushOutcome::Dropped | PushOutcome::EvictedOldest => {
-                    inner.stats.dropped_entries.fetch_add(1, Ordering::Relaxed);
+        // Correlate with the thread's active span (explicit metadata wins).
+        if entry.log_type == LogType::Log {
+            if let Some(ctx) = crate::trace::current() {
+                entry
+                    .metadata
+                    .entry("trace_id")
+                    .or_insert_with(|| Value::String(ctx.trace_id.clone()));
+                entry
+                    .metadata
+                    .entry("span_id")
+                    .or_insert_with(|| Value::String(ctx.span_id.clone()));
+            }
+        }
+        use crate::governor::Decision;
+        let stats = &inner.stats;
+        match inner
+            .processor
+            .process_with(&mut entry, inner.queue.fill_ratio())
+        {
+            Decision::Keep => {
+                // An error ships the recorded low-severity context first.
+                for context in inner.processor.take_flight_context(&entry) {
+                    self.enqueue(context);
                 }
+                self.enqueue(entry);
+            }
+            Decision::Sampled => {
+                stats.sampled_entries.fetch_add(1, Ordering::Relaxed);
+            }
+            Decision::RateLimited => {
+                stats.rate_limited_entries.fetch_add(1, Ordering::Relaxed);
+            }
+            Decision::Deduplicated => {
+                stats.deduplicated_entries.fetch_add(1, Ordering::Relaxed);
+            }
+            Decision::Recorded => {
+                stats.recorded_entries.fetch_add(1, Ordering::Relaxed);
+            }
+            Decision::Filtered => {}
+        }
+    }
+
+    fn enqueue(&self, entry: LogEntry) {
+        let inner = &self.inner;
+        match inner.queue.push(entry) {
+            PushOutcome::Accepted => {}
+            PushOutcome::Dropped | PushOutcome::EvictedOldest => {
+                inner.stats.dropped_entries.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -793,6 +943,49 @@ impl MicroLog {
 }
 
 impl MicroLogInner {
+    fn health(&self) -> Health {
+        use crate::health::{classify, Health};
+        let now = crate::entry::now_millis();
+        let s = &self.stats;
+        let r = Ordering::Relaxed;
+        let (wal_files, wal_bytes) = self
+            .engine
+            .wal
+            .as_ref()
+            .map(|w| (w.len(), w.size_bytes()))
+            .unwrap_or((0, 0));
+        let (queue_depth, queue_capacity) = (self.queue.len(), self.config.queue_capacity);
+        let (ok_ms, fail_ms) = (s.last_success_ms.load(r), s.last_failure_ms.load(r));
+        let ago = |t: u64| (t > 0).then(|| now.saturating_sub(t));
+        let count = s.latency_count.load(r);
+        Health {
+            status: classify(
+                self.shutdown_done.load(Ordering::SeqCst),
+                queue_depth,
+                queue_capacity,
+                wal_files,
+                ok_ms,
+                fail_ms,
+                now,
+            ),
+            queue_depth,
+            queue_capacity,
+            inflight_batches: self.engine.inflight(),
+            wal_files,
+            wal_bytes,
+            delivered_entries: s.delivered_entries.load(r),
+            dropped_entries: s.dropped_entries.load(r),
+            delivery_failures: s.delivery_failures.load(r),
+            last_success_ms_ago: ago(ok_ms),
+            last_failure_ms_ago: ago(fail_ms),
+            last_delivery_latency_ms: s.last_latency_ms.load(r),
+            avg_delivery_latency_ms: if count == 0 {
+                0.0
+            } else {
+                s.latency_sum_ms.load(r) as f64 / count as f64
+            },
+        }
+    }
     /// Drain the ingestion queue straight to the WAL, bypassing the (stuck)
     /// batcher. Entries without a WAL are counted dropped.
     fn spill_queue_to_wal(&self) {
@@ -843,6 +1036,10 @@ fn run_batcher(inner: Arc<MicroLogInner>) {
     let rx = inner.queue.receiver();
     let flush_interval = std::time::Duration::from_millis(inner.config.flush_interval_ms);
     let ticker = crossbeam_channel::tick(flush_interval);
+    let metrics_ticker = match inner.config.self_metrics_interval_ms {
+        0 => crossbeam_channel::never(),
+        ms => crossbeam_channel::tick(std::time::Duration::from_millis(ms)),
+    };
     let mut pending: Vec<LogEntry> = Vec::new();
     let mut pending_bytes: usize = 0;
 
@@ -869,7 +1066,11 @@ fn run_batcher(inner: Arc<MicroLogInner>) {
                     return;
                 }
             },
+            recv(metrics_ticker) -> _ => {
+                emit_self_metrics(&inner, &mut pending, &mut pending_bytes);
+            },
             recv(ticker) -> _ => {
+                absorb_summaries(&inner, &mut pending, &mut pending_bytes, false);
                 flush_batch(&inner, &mut pending, &mut pending_bytes);
             },
             recv(inner.flush_rx) -> _ => {
@@ -879,6 +1080,7 @@ fn run_batcher(inner: Arc<MicroLogInner>) {
                     pending_bytes += entry.approx_size();
                     pending.push(entry);
                 }
+                absorb_summaries(&inner, &mut pending, &mut pending_bytes, true);
                 flush_batch(&inner, &mut pending, &mut pending_bytes);
                 notify_flush_waiters(&inner);
             },
@@ -889,10 +1091,28 @@ fn run_batcher(inner: Arc<MicroLogInner>) {
                     pending_bytes += entry.approx_size();
                     pending.push(entry);
                 }
+                absorb_summaries(&inner, &mut pending, &mut pending_bytes, true);
                 flush_batch(&inner, &mut pending, &mut pending_bytes);
                 return;
             }
         }
+    }
+}
+
+/// Append `repeat_count` summaries for closed de-duplication windows (all open
+/// ones when `force`) to the batch being assembled.
+fn absorb_summaries(
+    inner: &MicroLogInner,
+    pending: &mut Vec<LogEntry>,
+    pending_bytes: &mut usize,
+    force: bool,
+) {
+    for entry in inner
+        .processor
+        .drain_summaries(crate::entry::now_millis(), force)
+    {
+        *pending_bytes += entry.approx_size();
+        pending.push(entry);
     }
 }
 
@@ -928,5 +1148,140 @@ fn flush_batch(inner: &MicroLogInner, pending: &mut Vec<LogEntry>, pending_bytes
 impl Drop for MicroLog {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+/// Add the logger's own health numbers to the batch as metric entries
+/// (`microlog.queue_depth`, `microlog.wal_bytes`, ...). They bypass sampling
+/// and filters: a throttled logger is exactly when they matter most.
+fn emit_self_metrics(
+    inner: &MicroLogInner,
+    pending: &mut Vec<LogEntry>,
+    pending_bytes: &mut usize,
+) {
+    let health = inner.health();
+    let mut tags = Map::new();
+    tags.insert(
+        "status".into(),
+        Value::String(health.status.as_str().into()),
+    );
+    for (name, value) in health.metrics() {
+        let mut entry = LogEntry::metric(name, value, Some(&tags));
+        inner.processor.finalize(&mut entry);
+        *pending_bytes += entry.approx_size();
+        pending.push(entry);
+    }
+}
+
+/// Minimal blocking HTTP/1.1 server for `/healthz` and `/stats` (std only).
+mod health_server {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Weak};
+    use std::time::Duration;
+
+    use super::MicroLogInner;
+
+    pub(super) fn spawn(inner: &Arc<MicroLogInner>, bind: &str) {
+        let listener = match TcpListener::bind(bind) {
+            Ok(l) => l,
+            Err(e) => {
+                crate::diag::report("health", &format!("cannot bind health_bind {bind}: {e}"));
+                return;
+            }
+        };
+        let _ = listener.set_nonblocking(true);
+        *inner.health_addr.lock() = listener.local_addr().ok();
+        let weak = Arc::downgrade(inner);
+        let _ = std::thread::Builder::new()
+            .name("tpt-microlog-health".into())
+            .spawn(move || serve(listener, weak));
+    }
+
+    /// Serves until the logger is dropped (the thread only holds a `Weak`).
+    fn serve(listener: TcpListener, weak: Weak<MicroLogInner>) {
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let Some(inner) = weak.upgrade() else { return };
+                    handle(stream, &inner);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if weak.strong_count() == 0 {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(40));
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(200)),
+            }
+        }
+    }
+
+    fn handle(mut stream: TcpStream, inner: &MicroLogInner) {
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+        let Ok(read_half) = stream.try_clone() else {
+            return;
+        };
+        let mut reader = BufReader::new(read_half);
+        let mut request_line = String::new();
+        if reader
+            .by_ref()
+            .take(2048)
+            .read_line(&mut request_line)
+            .is_err()
+        {
+            return;
+        }
+        // Drain the headers (bounded) so the client sees a clean response.
+        let mut header = String::new();
+        for _ in 0..64 {
+            header.clear();
+            match reader.by_ref().take(4096).read_line(&mut header) {
+                Ok(0) => break,
+                Ok(_) if header.trim().is_empty() => break,
+                Ok(_) => {}
+                Err(_) => return,
+            }
+        }
+        let mut parts = request_line.split_whitespace();
+        let (method, target) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+        let path = target.split('?').next().unwrap_or("");
+        let (code, body) = if method != "GET" {
+            (405, serde_json::json!({"error": "method not allowed"}))
+        } else {
+            match path {
+                "/healthz" | "/health" => {
+                    let h = inner.health();
+                    (h.status.http_status(), h.to_json())
+                }
+                "/stats" => {
+                    let mut body = inner.health().to_json();
+                    let counters: serde_json::Map<String, serde_json::Value> = inner
+                        .stats
+                        .counters()
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), v.into()))
+                        .collect();
+                    body["counters"] = serde_json::Value::Object(counters);
+                    (200, body)
+                }
+                _ => (404, serde_json::json!({"error": "not found"})),
+            }
+        };
+        let reason = match code {
+            200 => "OK",
+            404 => "Not Found",
+            405 => "Method Not Allowed",
+            _ => "Service Unavailable",
+        };
+        let payload = body.to_string();
+        let _ = write!(
+            stream,
+            "HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{payload}",
+            payload.len()
+        );
+        let _ = stream.flush();
     }
 }

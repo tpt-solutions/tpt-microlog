@@ -34,8 +34,10 @@ log.shutdown()  # flush + drain before exit
 - **Multi-backend** — Datadog, Elasticsearch, CloudWatch (SigV4), Grafana Loki, Splunk HEC, Prometheus (embedded `/metrics`), OTLP over gRPC or HTTP, generic HTTP, UDP, TCP, console, and local JSONL files with rotation; route to several at once with `fanout` or ordered `failover`.
 - **Structured + enriched** — arbitrary key/value metadata; optional hostname/PID/service enrichment; level filtering and sampling.
 - **Privacy built in** — `redact_keys`, custom `redact_patterns` and built-in detectors (email, card, SSN, JWT, ...) mask data before it reaches the WAL or the network.
+- **Volume control** — collapse bursts with `repeat_count` (`dedup_window_ms`), cap routine volume (`rate_limit_per_sec`, `adaptive_sampling`, `daily_budget_entries`), and keep DEBUG context in a flight recorder that ships only when an ERROR follows. WARN and above are never sampled or limited.
+- **Observable** — `health()` / `/healthz` / `/stats` and optional `microlog.*` self-metrics (queue depth, WAL bytes, drops, delivery latency).
 - **Never silent** — internal failures (delivery, WAL, worker panics, config) go to an `on_error` callback or stderr instead of vanishing.
-- **Fits your stack** — Python `logging.Handler`, Go `slog.Handler`, Rust `tracing` layer / `log` backend / panic hook, pino transport, plus a `tpt-microlog` CLI (`init`, `doctor`, `wal`, `tail`, `send-test`).
+- **Fits your stack** — Python `logging.Handler`, Go `slog.Handler`, Rust `tracing` layer / `log` backend / panic hook, pino transport, plus a `tpt-microlog` CLI (`init`, `doctor`, `wal ls|query|replay`, `tail`, `send-test`, `support-bundle`), W3C `traceparent` correlation and typed events.
 - **Zero configuration** — reads `tpt-log.toml`, then `TPT_LOG_*` environment variables, then your code's overrides.
 
 ## Installation
@@ -48,7 +50,7 @@ pip install tpt-microlog
 npm install tpt-microlog
 
 # Go (cgo wrapper)
-go get github.com/tpt-solutions/tpt-microlog-go
+go get github.com/tpt-solutions/tpt-microlog/tpt-log-go   # + a prebuilt native library, see tpt-log-go/README.md
 
 # Rust
 cargo add tpt-log-core tpt-log-transport
@@ -166,6 +168,8 @@ wal_enabled = true
 wal_max_size_bytes = 104857600
 ```
 
+The full documentation (quickstarts per language, backend cookbook, delivery guarantees explained, troubleshooting, benchmark methodology) is an [mdBook](docs/book) — `mdbook build docs/book`.
+
 More ready-made configurations live in the [`tpt-log.toml` gallery](docs/toml-gallery.md), and a [JSON Schema](tpt-log-core/tpt-log.schema.json) gives editors completion and validation.
 
 Key environment variables: `TPT_LOG_CONFIG` (explicit config file path), `TPT_LOG_BACKEND`, `TPT_LOG_ENDPOINT`, `TPT_LOG_API_KEY`, `TPT_LOG_SERVICE`, `TPT_LOG_BATCH_SIZE`, `TPT_LOG_FLUSH_INTERVAL_MS`, `TPT_LOG_QUEUE_CAPACITY`, `TPT_LOG_QUEUE_FULL_POLICY`, `TPT_LOG_DURABILITY`, `TPT_LOG_SHUTDOWN_TIMEOUT_MS`, `TPT_LOG_WAL_ENABLED`, `TPT_LOG_WAL_DIR`, `TPT_LOG_WAL_RETRY_INTERVAL_MS`, `TPT_LOG_MIN_LEVEL`, `TPT_LOG_SAMPLE_RATE`, `TPT_LOG_ENRICHMENT`, `TPT_LOG_ENRICH_ENV_VARS`, `TPT_LOG_FAST_MODE`, `TPT_LOG_FILE_PATH`, `TPT_LOG_NET_ENDPOINT`, `TPT_LOG_GRPC_ENDPOINT`, `TPT_LOG_EXTRA_HEADERS`, `TPT_LOG_PROMETHEUS_BIND`, `TPT_LOG_AWS_REGION`, `TPT_LOG_AWS_ACCESS_KEY`, `TPT_LOG_AWS_SECRET_KEY`, `TPT_LOG_AWS_LOG_GROUP`, `TPT_LOG_AWS_LOG_STREAM`.
@@ -216,8 +220,9 @@ Remaining resource targets (validated by design and covered by tests, not yet tr
 | [`tpt-log-ffi/`](tpt-log-ffi/) | C ABI boundary (`include/tpt_microlog.h`) for C/C++/Go consumers |
 | [`tpt-log-py/`](tpt-log-py/) | PyO3 wrapper shipped to PyPI as `tpt-microlog` (maturin, abi3 3.9+) |
 | [`tpt-log-wasm/`](tpt-log-wasm/) | Self-contained wasm-bindgen wrapper shipped to npm as `tpt-microlog` |
-| [`tpt-log-go/`](tpt-log-go/) | cgo wrapper module (`github.com/tpt-solutions/tpt-microlog-go`) with a `slog` handler |
+| [`tpt-log-go/`](tpt-log-go/) | cgo wrapper module (`github.com/tpt-solutions/tpt-microlog/tpt-log-go`) with a `slog` handler |
 | [`tpt-log-cli/`](tpt-log-cli/) | The `tpt-microlog` command line: `init`, `doctor`, `wal`, `tail`, `send-test` |
+| [`tpt-log-agent/`](tpt-log-agent/) | `tpt-microlog-agent`: a sidecar that accepts logs over UDP/TCP/HTTP/Unix socket for languages without a binding |
 | [`examples/`](examples/) | Runnable examples, [recipes](examples/recipes/) and [observability stacks](examples/stacks/) |
 | [`docs/`](docs/) | [`tpt-log.toml` gallery](docs/toml-gallery.md) |
 | `.github/workflows/` | CI (OS matrix, MSRV, clippy, fmt, cargo-deny, Python/Go/WASM smoke tests, benchmark regression) and PyPI/npm publish pipelines |

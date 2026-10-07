@@ -19,6 +19,34 @@ across the workspace and the project is pre-1.0.
   hook, `mlog!` macro, `Builder`, and a pino bridge (`tpt-microlog/pino`).
 - **`tpt-microlog` CLI**: `init`, `doctor`, `wal ls|replay|dead|purge`, `tail`,
   `send-test`.
+- **Volume governors**: `dedup_window_ms` (burst folding with `repeat_count`),
+  `rate_limit_per_sec`, `adaptive_sampling`, `daily_budget_entries` and an
+  error-triggered flight recorder (`flight_recorder_size`); WARN+ is never
+  sampled or limited. New `stats()` counters for each.
+- **Trace correlation**: W3C `traceparent` parsing, span guards that stamp
+  `trace_id`/`span_id` on every entry (Rust `trace`, Python `trace_span`, the
+  `tracing` layer), and **typed events** (Rust `Event` trait, Python
+  `log.event`, TypeScript `EventMap`).
+- **CLI**: `wal query` (decode/search undelivered entries) and
+  `support-bundle` (masked diagnostics to attach to an issue).
+- **`tpt-microlog-agent`** sidecar (`tpt-log-agent`): UDP, TCP, HTTP and Unix-socket
+  ingestion of JSON/text logs and metrics for languages without a binding.
+- **Edge/WASM extras**: browser error auto-capture, an offline queue with
+  IndexedDB persistence, and a Cloudflare Worker example.
+- **Documentation site** (`docs/book`, mdBook): per-language quickstarts, backend
+  cookbook, delivery guarantees explained, volume control, privacy, observability,
+  CLI, troubleshooting and benchmark methodology.
+- **Release tooling**: `scripts/release.py` (version bump + changelog roll,
+  never publishes), `release.yml` (CLI/agent binaries, Go static libraries,
+  CycloneDX SBOMs, Sigstore signatures, draft GitHub release) and
+  `docs/RELEASING.md`.
+- **Go**: the module path is now `github.com/tpt-solutions/tpt-microlog/tpt-log-go`
+  (resolvable from this repository via `tpt-log-go/vX.Y.Z` tags), the C header
+  is vendored, link flags are per platform, and `cmd/fetchlib` downloads and
+  verifies a prebuilt static library.
+- **Health**: `health()` snapshot (also Python/Go/C `tpt_log_health_json`),
+  `health_bind` serving `/healthz` and `/stats`, and `self_metrics_interval_ms`
+  for `microlog.*` metrics.
 - **Backends**: Grafana Loki, Splunk HEC, OTLP/HTTP, console, and
   fan-out/failover routing; named presets and TLS/proxy options.
 - **`tpt-log.toml` JSON Schema** and a validated [config gallery](docs/toml-gallery.md).

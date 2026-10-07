@@ -34,7 +34,6 @@
 package microlog
 
 /*
-#cgo LDFLAGS: -ltpt_log_ffi
 #include <stdlib.h>
 #include <string.h>
 #include "tpt_microlog.h"
@@ -287,8 +286,15 @@ type Stats struct {
 	RetriedEntries   uint64 `json:"retried_entries"`
 	DroppedBatches   uint64 `json:"dropped_batches"`
 	DroppedEntries   uint64 `json:"dropped_entries"`
-	Queued           uint64 `json:"queued"`
-	Inflight         uint64 `json:"inflight"`
+	// Volume governors and delivery health.
+	SampledEntries      uint64 `json:"sampled_entries"`
+	RateLimitedEntries  uint64 `json:"rate_limited_entries"`
+	DeduplicatedEntries uint64 `json:"deduplicated_entries"`
+	RecordedEntries     uint64 `json:"recorded_entries"`
+	DeliveryFailures    uint64 `json:"delivery_failures"`
+	LastLatencyMs       uint64 `json:"last_latency_ms"`
+	Queued              uint64 `json:"queued"`
+	Inflight            uint64 `json:"inflight"`
 }
 
 // Stats returns a snapshot of delivery counters.
@@ -302,7 +308,7 @@ func (m *MicroLog) Stats() (Stats, error) {
 	if m.handle == nil {
 		return out, errors.New("microlog: logger is closed")
 	}
-	buf := make([]C.char, 512)
+	buf := make([]C.char, 2048)
 	n := C.tpt_log_stats_json(m.handle, &buf[0], C.size_t(len(buf)))
 	if n < 0 {
 		return out, fmt.Errorf("microlog: stats failed (code %d)", n)
@@ -310,6 +316,46 @@ func (m *MicroLog) Stats() (Stats, error) {
 	payload := C.GoStringN(&buf[0], C.int(n-1))
 	if err := json.Unmarshal([]byte(payload), &out); err != nil {
 		return out, fmt.Errorf("microlog: stats decode: %w", err)
+	}
+	return out, nil
+}
+
+// Health is a snapshot of the logger's health.
+type Health struct {
+	Status                string  `json:"status"` // "ok", "degraded", "down" or "stopped"
+	QueueDepth            int     `json:"queue_depth"`
+	QueueCapacity         int     `json:"queue_capacity"`
+	InflightBatches       int     `json:"inflight_batches"`
+	WalFiles              int     `json:"wal_files"`
+	WalBytes              uint64  `json:"wal_bytes"`
+	DeliveredEntries      uint64  `json:"delivered_entries"`
+	DroppedEntries        uint64  `json:"dropped_entries"`
+	DeliveryFailures      uint64  `json:"delivery_failures"`
+	LastSuccessMsAgo      *uint64 `json:"last_success_ms_ago"`
+	LastFailureMsAgo      *uint64 `json:"last_failure_ms_ago"`
+	LastDeliveryLatencyMs uint64  `json:"last_delivery_latency_ms"`
+	AvgDeliveryLatencyMs  float64 `json:"avg_delivery_latency_ms"`
+}
+
+// Health returns the current health snapshot (queue depth, WAL backlog,
+// delivery latency and a coarse status).
+func (m *MicroLog) Health() (Health, error) {
+	var out Health
+	if m == nil {
+		return out, errors.New("microlog: logger is closed")
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.handle == nil {
+		return out, errors.New("microlog: logger is closed")
+	}
+	buf := make([]C.char, 2048)
+	n := C.tpt_log_health_json(m.handle, &buf[0], C.size_t(len(buf)))
+	if n < 0 {
+		return out, fmt.Errorf("microlog: health failed (code %d)", n)
+	}
+	if err := json.Unmarshal([]byte(C.GoStringN(&buf[0], C.int(n-1))), &out); err != nil {
+		return out, fmt.Errorf("microlog: health decode: %w", err)
 	}
 	return out, nil
 }

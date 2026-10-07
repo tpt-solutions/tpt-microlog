@@ -1,0 +1,10 @@
+[book]
+title = "tpt-microlog"
+description = "The microscopic telemetry and log router: reliable delivery, zero infrastructure."
+src = "src"
+language = "en"
+
+[output.html]
+git-repository-url = "https://github.com/tpt-solutions/tpt-microlog"
+default-theme = "light"
+preferred-dark-theme = "navy"

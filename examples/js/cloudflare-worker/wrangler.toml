@@ -1,0 +1,10 @@
+# UNTESTED example configuration: see src/index.js.
+name = "tpt-microlog-edge-demo"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+
+[vars]
+LOG_ENDPOINT = "https://logs.example.com/v1"
+LOG_BACKEND = "custom"
+
+# Set the secret with: wrangler secret put LOG_API_KEY

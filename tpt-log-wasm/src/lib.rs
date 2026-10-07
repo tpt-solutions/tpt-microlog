@@ -725,6 +725,39 @@ impl MicroLog {
         self.emit(level, message, &metadata, "log");
     }
 
+    /// Log a structured event: `name` is the message, `fields` the metadata,
+    /// plus `event` and `event_version` fields. `options` may hold `level`
+    /// (default `"INFO"`) and `version` (default 1).
+    #[wasm_bindgen(js_name = event)]
+    pub fn event(&self, name: &str, fields: JsValue, options: JsValue) {
+        let level = option_str(&options, "level").unwrap_or_else(|| "INFO".to_string());
+        let version = option_f64(&options, "version", 1.0) as u64;
+        let mut md = js_to_metadata(&fields);
+        md.insert(
+            "event".to_string(),
+            serde_json::Value::String(name.to_string()),
+        );
+        md.insert(
+            "event_version".to_string(),
+            serde_json::Value::from(version),
+        );
+        if let Some(service) = &self.inner.service {
+            md.entry("service".to_string())
+                .or_insert(serde_json::Value::String(service.clone()));
+        }
+        if !self.inner.accept(&level) {
+            return;
+        }
+        self.push_entry(Entry {
+            timestamp: now_ms(),
+            level: level.to_ascii_uppercase(),
+            log_type: "log".to_string(),
+            message: name.to_string(),
+            metadata: md,
+            retries: 0,
+        });
+    }
+
     #[wasm_bindgen(js_name = trace)]
     pub fn trace(&self, message: &str, metadata: JsValue) {
         self.emit("TRACE", message, &metadata, "log");

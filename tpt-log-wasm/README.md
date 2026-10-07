@@ -102,6 +102,65 @@ logger.info({ orderId: 5 }, 'order placed');
 Ending the stream flushes and shuts the logger down. The entry timestamp is the
 time the line reaches the bridge; pino's own `time` field is kept as metadata.
 
+### Browser error capture
+
+```js
+import { installErrorCapture } from 'tpt-microlog/browser';
+
+const stop = installErrorCapture(log, { metadata: { release: '1.4.2' } });
+```
+
+Uncaught exceptions and unhandled promise rejections are logged at ERROR with
+message, stack and location (failed `<img>`/`<script>` loads at WARN with
+`captureResourceErrors: true`). Identical errors inside `dedupeWindowMs` are
+folded and reported later with a `repeat_count`, so an error in a render loop
+cannot flood the logger.
+
+### Offline queue
+
+```js
+import { installOfflineQueue, createIndexedDbStore } from 'tpt-microlog/offline';
+
+const queue = installOfflineQueue({
+  endpoint: 'https://logs.example.com/v1',
+  store: createIndexedDbStore('my-app-logs'),
+});
+```
+
+Wraps `fetch` for requests to `endpoint`. When the network is down (or the
+server answers 5xx/408/425/429) the request is stored and the engine is told it
+was accepted, so logs survive a closed tab. Stored requests are replayed
+oldest-first on `online`, every 30 s, and after the next successful send;
+`maxItems` bounds the queue (oldest dropped, reported via `onDrop`). Entries
+parked in the queue already count as delivered in `stats()`: use
+`await queue.size()` for what is still waiting. Other 4xx responses are not
+queued, since they can never succeed. The IndexedDB store targets browsers and
+service workers; `createMemoryStore()` is available elsewhere.
+
+### Edge runtimes (Cloudflare Workers, Vercel Edge)
+
+Workers import `.wasm` as a pre-compiled module, so initialise synchronously
+and flush per request (timers do not run between requests):
+
+```js
+import { initSync, MicroLog } from 'tpt-microlog';
+import wasm from 'tpt-microlog/dist/tpt_log_wasm_bg.wasm';
+initSync({ module: wasm });
+
+const log = new MicroLog({ endpoint: env.LOG_ENDPOINT, apiKey: env.LOG_API_KEY });
+// ...in the fetch handler:
+ctx.waitUntil(log.flush());
+```
+
+See [`examples/js/cloudflare-worker`](../examples/js/cloudflare-worker). On
+Vercel Edge import the module as `.../tpt_log_wasm_bg.wasm?module`. API keys
+are safe in a Worker secret but must never be shipped to browsers.
+
+> The error-capture and offline-queue logic is covered by Node tests with
+> injected event targets and a memory store. The IndexedDB store, the Worker
+> example and the Vercel variant have not been run in a real browser or edge
+> runtime.
+
 ## API
 
 | Member | Description |

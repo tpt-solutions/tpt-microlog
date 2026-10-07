@@ -166,6 +166,15 @@ mod native {
             "failover" => config.failover = value.extract()?,
             "ca_cert" => config.ca_cert = value.extract()?,
             "proxy" => config.proxy = value.extract()?,
+            "dedup_window_ms" => config.dedup_window_ms = value.extract()?,
+            "rate_limit_per_sec" => config.rate_limit_per_sec = value.extract()?,
+            "adaptive_sampling" => config.adaptive_sampling = value.extract()?,
+            "adaptive_sampling_floor" => config.adaptive_sampling_floor = value.extract()?,
+            "flight_recorder_size" => config.flight_recorder_size = value.extract()?,
+            "flight_recorder_max_level" => config.flight_recorder_max_level = value.extract()?,
+            "daily_budget_entries" => config.daily_budget_entries = value.extract()?,
+            "health_bind" => config.health_bind = value.extract()?,
+            "self_metrics_interval_ms" => config.self_metrics_interval_ms = value.extract()?,
             "preset" => {
                 let name: String = value.extract()?;
                 config.apply_preset(&name).map_err(PyValueError::new_err)?;
@@ -312,18 +321,20 @@ mod native {
         /// Delivery counters as a dict, e.g.
         /// `{"delivered_batches": 3, "dropped_entries": 0, ...}`.
         fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-            use std::sync::atomic::Ordering::Relaxed;
-            let s = self.inner.stats();
             let dict = PyDict::new(py);
-            dict.set_item("delivered_batches", s.delivered_batches.load(Relaxed))?;
-            dict.set_item("delivered_entries", s.delivered_entries.load(Relaxed))?;
-            dict.set_item("wal_writes", s.wal_writes.load(Relaxed))?;
-            dict.set_item("retried_entries", s.retried_entries.load(Relaxed))?;
-            dict.set_item("dropped_batches", s.dropped_batches.load(Relaxed))?;
-            dict.set_item("dropped_entries", s.dropped_entries.load(Relaxed))?;
+            for (name, value) in self.inner.stats().counters() {
+                dict.set_item(name, value)?;
+            }
             dict.set_item("queued", self.inner.queued())?;
             dict.set_item("inflight", self.inner.inflight())?;
             Ok(dict)
+        }
+
+        /// Logger health: status ("ok" | "degraded" | "down" | "stopped"),
+        /// queue depth, WAL backlog, delivery latency and counters.
+        fn health<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+            let json = self.inner.health().to_json().to_string();
+            py.import("json")?.call_method1("loads", (json,))
         }
 
         /// Context manager entry: `with MicroLog(...) as log: ...`.

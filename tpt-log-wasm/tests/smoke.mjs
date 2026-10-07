@@ -52,3 +52,22 @@ assert.equal(log.queued(), 1, "transient failure re-queues");
 
 log.dispose();
 console.log("wasm smoke OK");
+
+// Typed events (run last: reuses the module and fetch mock above).
+{
+  const events = new MicroLog({ endpoint: "http://localhost:9/logs", batchSize: 100, flushInterval: 60 });
+  status = 200;
+  bodies.length = 0;
+  events.event("order_placed", { orderId: 7 }, { level: "WARN", version: 2 });
+  events.event("heartbeat");
+  await events.flush();
+  const sent = bodies.flatMap((b) => JSON.parse(b.text).entries);
+  const order = sent.find((e) => e.message === "order_placed");
+  assert.equal(order.level, "WARN");
+  assert.equal(order.metadata.orderId, 7);
+  assert.equal(order.metadata.event, "order_placed");
+  assert.equal(order.metadata.event_version, 2);
+  assert.equal(sent.find((e) => e.message === "heartbeat").metadata.event_version, 1);
+  events.dispose();
+  console.log("wasm events OK");
+}

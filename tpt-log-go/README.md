@@ -7,7 +7,7 @@ This module is a thin [cgo](https://pkg.go.dev/cmd/cgo) wrapper over the native
 write-ahead log behaviour comes from the Rust engine; this package only converts
 Go values into C calls and surfaces errors.
 
-- **Module:** `github.com/tpt-solutions/tpt-microlog-go`
+- **Module:** `github.com/tpt-solutions/tpt-microlog/tpt-log-go` (a subdirectory module: tags are `tpt-log-go/vX.Y.Z`)
 - **Repository:** <https://github.com/tpt-solutions/tpt-microlog/tree/master/tpt-log-go>
 
 ## Requirements
@@ -16,36 +16,54 @@ Go values into C calls and surfaces errors.
 - A C compiler
 - cgo enabled (the default on supported platforms)
 
-## Build
+## Install
 
-Build the native library first, from the repository root:
+```sh
+go get github.com/tpt-solutions/tpt-microlog/tpt-log-go
+```
+
+The package links the native engine (`libtpt_log_ffi.a`), so you need the
+static library for your platform. The C header is already vendored in the
+module, so no `CGO_CFLAGS` are needed.
+
+### Option 1: prebuilt library (linux/darwin amd64+arm64, windows amd64)
+
+Release assets are named `libtpt_log_ffi-<goos>_<goarch>.tar.gz` with a
+`.sha256` beside each. The fetcher downloads, verifies and unpacks the right
+one:
+
+```sh
+go run github.com/tpt-solutions/tpt-microlog/tpt-log-go/cmd/fetchlib@latest -version v0.1.0
+# prints:  export CGO_LDFLAGS="-L/abs/path/tpt-lib/linux_amd64"
+export CGO_LDFLAGS="-L$PWD/tpt-lib/linux_amd64"
+go build ./...
+```
+
+It refuses to install a library whose SHA-256 does not match. Use `-dest`,
+`-os`, `-arch` or `-base-url` (for a mirror) to adjust. In a clone of this
+repository you can fetch straight into `tpt-log-go/lib/<goos>_<goarch>/`, where
+the module already looks (`-dest lib/linux_amd64`) and no `CGO_LDFLAGS` are
+needed.
+
+### Option 2: build it yourself
 
 ```sh
 cargo build --release -p tpt-log-ffi
+export CGO_LDFLAGS="-L$PWD/target/release"
 ```
 
-The resulting `libtpt_log_ffi` library (`target/release/libtpt_log_ffi.a`,
-`.so`, or `tpt_log_ffi.dll`) must be on the linker search path when building
-this module. The cgo directives in `microlog.go` select the platform-specific
-library name and linker flags.
-
-If the header and library are not on the default search paths:
-
-```sh
-export CGO_CFLAGS="-I/path/to/tpt-log-ffi/include"
-export CGO_LDFLAGS="-L/path/to/target/release"
-```
-
-On Windows, build the native library with the GNU toolchain and link it
-statically:
+The directory also contains the shared library; to force static linking add
+`-Wl,-Bstatic -ltpt_log_ffi -Wl,-Bdynamic` or copy `libtpt_log_ffi.a` into its
+own directory. On Windows use the GNU toolchain (cgo needs `gcc`):
 
 ```sh
 cargo build --release -p tpt-log-ffi --target x86_64-pc-windows-gnu
-
-export CGO_LDFLAGS="-L.../target/x86_64-pc-windows-gnu/release \
-  -Wl,-Bstatic -ltpt_log_ffi -Wl,-Bdynamic \
-  -lntdll -lws2_32 -lbcrypt -luserenv"
+export CGO_LDFLAGS="-L$PWD/target/x86_64-pc-windows-gnu/release -Wl,-Bstatic -ltpt_log_ffi -Wl,-Bdynamic"
 ```
+
+The platform's system libraries (`-lm -ldl -lpthread` on Linux, Security and
+CoreFoundation frameworks on macOS, `-lntdll -lws2_32 -lbcrypt -luserenv` on
+Windows) are already named in `cgo_link.go`.
 
 ## Usage
 
@@ -55,7 +73,7 @@ package main
 import (
 	"log"
 
-	microlog "github.com/tpt-solutions/tpt-microlog-go"
+	microlog "github.com/tpt-solutions/tpt-microlog/tpt-log-go"
 )
 
 func main() {

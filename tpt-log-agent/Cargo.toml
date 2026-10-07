@@ -1,0 +1,27 @@
+[package]
+name = "tpt-log-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "tpt-microlog sidecar: accepts logs over UDP, TCP, HTTP or a Unix socket and delivers them with batching, WAL and retries."
+publish = false
+
+[lib]
+name = "tpt_log_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tpt-microlog-agent"
+path = "src/main.rs"
+
+[dependencies]
+tpt-log-core = { path = "../tpt-log-core", version = "0.1.0" }
+tpt-log-transport = { path = "../tpt-log-transport", version = "0.1.0" }
+serde_json = { workspace = true }
+ctrlc = { version = "3", features = ["termination"] }
+
+[dev-dependencies]
+tempfile = "3"

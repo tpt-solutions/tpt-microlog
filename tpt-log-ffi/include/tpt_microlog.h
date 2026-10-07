@@ -115,12 +115,23 @@ int32_t tpt_log_flush(tpt_log_handle* handle);
  * including the trailing NUL). Returns the number of bytes written on
  * success; TPT_LOG_NULL_ARGUMENT for a NULL buffer and
  * TPT_LOG_STATS_TOO_SMALL (-2) when `cap` is insufficient. A NULL handle
- * reports all-zero counters. Example:
- * {"delivered_batches":3,"delivered_entries":312,"wal_writes":0,
- *  "retried_entries":0,"dropped_batches":0,"dropped_entries":0,
- *  "queued":0,"inflight":0}
+ * reports all-zero counters. Keys: delivered_batches, delivered_entries,
+ * wal_writes, retried_entries, dropped_batches, dropped_entries,
+ * sampled_entries, rate_limited_entries, deduplicated_entries,
+ * recorded_entries, delivery_failures, last_latency_ms, queued, inflight.
+ * Use a buffer of at least 1024 bytes; more keys may be added over time.
  */
 int32_t tpt_log_stats_json(tpt_log_handle* handle, char* buf, size_t cap);
+
+/**
+ * Logger health as a JSON object (same buffer contract as
+ * tpt_log_stats_json): status ("ok" | "degraded" | "down" | "stopped"),
+ * queue_depth, queue_capacity, inflight_batches, wal_files, wal_bytes,
+ * delivered_entries, dropped_entries, delivery_failures,
+ * last_success_ms_ago, last_failure_ms_ago, last_delivery_latency_ms,
+ * avg_delivery_latency_ms. A NULL handle reports {"status":"stopped"}.
+ */
+int32_t tpt_log_health_json(tpt_log_handle* handle, char* buf, size_t cap);
 
 /** Flush pending batches and drain the WAL. Idempotent. */
 int32_t tpt_log_shutdown(tpt_log_handle* handle);

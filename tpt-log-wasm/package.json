@@ -38,6 +38,10 @@
     "index.d.ts",
     "pino.js",
     "pino.d.ts",
+    "browser.js",
+    "browser.d.ts",
+    "offline.js",
+    "offline.d.ts",
     "README.md",
     "CHANGELOG.md"
   ],
@@ -54,6 +58,16 @@
       "types": "./pino.d.ts",
       "import": "./pino.js",
       "default": "./pino.js"
+    },
+    "./browser": {
+      "types": "./browser.d.ts",
+      "import": "./browser.js",
+      "default": "./browser.js"
+    },
+    "./offline": {
+      "types": "./offline.d.ts",
+      "import": "./offline.js",
+      "default": "./offline.js"
     },
     "./dist/*": "./dist/*",
     "./package.json": "./package.json"

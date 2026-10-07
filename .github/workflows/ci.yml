@@ -93,6 +93,42 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  docs:
+    name: docs site builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: mdbook
+      - name: Build the book (includes resolve, no broken pages)
+        run: mdbook build docs/book
+      - name: No broken relative links in the built pages
+        run: |
+          python3 - <<'PY'
+          import glob, os, re, sys
+          bad = []
+          for page in glob.glob("docs/book/book/**/*.html", recursive=True):
+              html = open(page, encoding="utf-8").read()
+              for href in re.findall(r'href="([^"#]+)(?:#[^"]*)?"', html):
+                  if re.match(r"^(https?:|mailto:|data:|//)", href):
+                      continue
+                  if not os.path.exists(os.path.normpath(os.path.join(os.path.dirname(page), href))):
+                      bad.append((page, href))
+          print("broken links:", bad)
+          sys.exit(1 if bad else 0)
+          PY
+
+  release-tooling:
+    name: release scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: All versions agree
+        run: python3 scripts/release.py --check
+      - name: Release script tests
+        run: python3 scripts/test_release.py
+
   python:
     name: python smoke (${{ matrix.os }}, py${{ matrix.python }})
     runs-on: ${{ matrix.os }}
@@ -140,13 +176,17 @@ jobs:
         with:
           go-version-file: tpt-log-go/go.mod
       - run: cargo build --release -p tpt-log-ffi
-      - name: go vet + go test (links the static library)
+      - name: The vendored C header matches the FFI crate's
+        run: diff tpt-log-ffi/include/tpt_microlog.h tpt-log-go/tpt_microlog.h
+      - name: Place the static library where the module looks for it
+        run: |
+          mkdir -p tpt-log-go/lib/linux_amd64
+          cp target/release/libtpt_log_ffi.a tpt-log-go/lib/linux_amd64/
+      - name: "go vet + go test (no CGO_* variables; the same path users get)"
         working-directory: tpt-log-go
         env:
           CGO_ENABLED: "1"
         run: |
-          export CGO_CFLAGS="-I$GITHUB_WORKSPACE/tpt-log-ffi/include"
-          export CGO_LDFLAGS="-L$GITHUB_WORKSPACE/target/release -Wl,-Bstatic -ltpt_log_ffi -Wl,-Bdynamic -lm -ldl -lpthread"
           go vet ./...
           go test -count=1 ./...
 
@@ -183,6 +223,7 @@ jobs:
           cd tpt-log-wasm
           npm install --no-save --no-package-lock pino@9
           node tests/pino.mjs
+          node tests/extras.mjs
           # The tarball must ship the pino bridge.
           npm pack --dry-run 2>&1 | tee pack.txt
           grep -q "pino.js" pack.txt

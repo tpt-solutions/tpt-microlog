@@ -16,6 +16,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `redactKeys`, `redactPatterns`, `redactBuiltin` and `onError` options.
 - `exports` map in `package.json` (`.`, `./pino`, `./dist/*`).
 
+- `tpt-microlog/browser`: `installErrorCapture` (uncaught errors, unhandled
+  rejections, optional resource failures, de-duplicated).
+- `tpt-microlog/offline`: `installOfflineQueue` with IndexedDB and memory stores.
+- `event(name, fields, options)` for structured events, with an augmentable
+  `EventMap` for type-checked event names.
+
 ### Fixed
 
 - `shutdown()` / `dispose()` cancel the pending flush timer instead of leaving

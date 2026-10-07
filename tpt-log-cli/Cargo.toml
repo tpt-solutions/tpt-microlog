@@ -17,3 +17,6 @@ path = "src/main.rs"
 tpt-log-core = { path = "../tpt-log-core", version = "0.1.0" }
 tpt-log-transport = { path = "../tpt-log-transport", version = "0.1.0" }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

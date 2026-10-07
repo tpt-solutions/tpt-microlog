@@ -30,7 +30,13 @@ Use the issue forms; they ask for what is needed to reproduce a problem.
 3. **Include what you expected and what happened.** For missing logs, the
    `stats()` counters (`dropped_entries`, `wal_writes`, ...) and any message
    reported through `set_on_error` / stderr tell us where they went.
-4. **Redact secrets** (API keys, tokens, customer data) before pasting.
+4. **Attach a support bundle** for delivery problems: `tpt-microlog
+   support-bundle` writes a JSON file with your effective config, health
+   checks and a sample of undelivered entries. Secrets, header values and URL
+   credentials are masked, messages are scrubbed of emails/cards/tokens, and
+   entry metadata is reduced to key names. Skim it before attaching.
+5. **Redact secrets** (API keys, tokens, customer data) before pasting
+   anything else.
 
 ## Security issues
 

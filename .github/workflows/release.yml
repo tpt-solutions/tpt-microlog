@@ -1,0 +1,216 @@
+name: Release
+
+# Builds the release artifacts for a version tag and attaches them, signed and
+# attested, to a DRAFT GitHub release for a human to review and publish.
+#
+# It does NOT publish to crates.io, PyPI or npm: those have their own,
+# separately triggered workflows (publish-py.yml, publish-npm.yml).
+#
+# Cut a release locally with `python scripts/release.py X.Y.Z`, review the diff,
+# commit, then push the tag `vX.Y.Z` (and `tpt-log-go/vX.Y.Z` for the Go module).
+# Run this workflow manually with dry_run = true to build everything without
+# creating a release.
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and sign nothing; only check the artifacts compile
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: verify version and notes
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: All versions agree, and the tag matches them
+        id: v
+        run: |
+          python3 scripts/release.py --check
+          version=$(python3 scripts/release.py --check | awk '{print $NF}')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "v$version" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match the workspace version v$version"; exit 1
+          fi
+      - name: Release notes come from the changelog
+        run: python3 scripts/release.py --notes "${{ steps.v.outputs.version }}" > notes.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: notes
+          path: notes.md
+
+  binaries:
+    name: CLI + agent (${{ matrix.name }})
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, name: linux_amd64 }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu, name: linux_arm64, cross: true }
+          - { os: macos-latest, target: x86_64-apple-darwin, name: darwin_amd64 }
+          - { os: macos-latest, target: aarch64-apple-darwin, name: darwin_arm64 }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, name: windows_amd64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Cross toolchain (linux arm64)
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+      - run: cargo build --release --locked -p tpt-log-cli -p tpt-log-agent --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          version="${{ needs.verify.outputs.version }}"
+          stem="tpt-microlog-${version}-${{ matrix.name }}"
+          mkdir "$stem"
+          bin="target/${{ matrix.target }}/release"
+          if [ "${{ matrix.name }}" = "windows_amd64" ]; then ext=".exe"; else ext=""; fi
+          cp "$bin/tpt-microlog$ext" "$bin/tpt-microlog-agent$ext" "$stem/"
+          cp LICENSE-MIT LICENSE-APACHE README.md "$stem/"
+          mkdir -p dist
+          if [ "${{ matrix.name }}" = "windows_amd64" ]; then
+            7z a "dist/$stem.zip" "$stem" > /dev/null
+            asset="$stem.zip"
+          else
+            tar czf "dist/$stem.tar.gz" "$stem"
+            asset="$stem.tar.gz"
+          fi
+          (cd dist && sha256sum "$asset" > "$asset.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.name }}
+          path: dist/*
+
+  ffi:
+    name: Go static library (${{ matrix.name }})
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, name: linux_amd64 }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu, name: linux_arm64, cross: aarch64 }
+          - { os: macos-latest, target: x86_64-apple-darwin, name: darwin_amd64 }
+          - { os: macos-latest, target: aarch64-apple-darwin, name: darwin_arm64 }
+          # cgo on Windows uses the MinGW toolchain, so the library is built for -gnu.
+          - { os: ubuntu-latest, target: x86_64-pc-windows-gnu, name: windows_amd64, cross: mingw }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ffi-${{ matrix.target }}
+      - name: Cross toolchain
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          if [ "${{ matrix.cross }}" = "aarch64" ]; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+            echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          else
+            sudo apt-get install -y gcc-mingw-w64-x86-64
+          fi
+      - name: Build only the static library
+        run: cargo rustc --release --locked --lib -p tpt-log-ffi --target ${{ matrix.target }} --crate-type staticlib
+      - name: Package (libtpt_log_ffi-<goos>_<goarch>.tar.gz, the name `fetchlib` expects)
+        run: |
+          stem="libtpt_log_ffi-${{ matrix.name }}"
+          mkdir "$stem"
+          cp "target/${{ matrix.target }}/release/libtpt_log_ffi.a" "$stem/"
+          cp tpt-log-ffi/include/tpt_microlog.h "$stem/"
+          mkdir -p dist
+          tar czf "dist/$stem.tar.gz" "$stem"
+          (cd dist && sha256sum "$stem.tar.gz" > "$stem.tar.gz.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ffi-${{ matrix.name }}
+          path: dist/*
+
+  sbom:
+    name: SBOM
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-cyclonedx
+      - name: CycloneDX SBOMs for the shipped crates
+        run: |
+          cargo cyclonedx --format json --all
+          mkdir -p dist
+          for crate in tpt-log-core tpt-log-transport tpt-log-ffi tpt-log-cli tpt-log-agent; do
+            cp "$crate/$crate.cdx.json" "dist/${crate}-${{ needs.verify.outputs.version }}.cdx.json"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: dist/*
+
+  release:
+    name: sign, attest and draft the release
+    needs: [verify, binaries, ffi, sbom]
+    if: ${{ github.event_name == 'push' || inputs.dry_run == false }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the draft release
+      id-token: write # keyless Sigstore signing
+      attestations: write # build-provenance attestations
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Gather
+        run: |
+          mkdir dist
+          find artifacts -type f ! -name notes.md -exec cp {} dist/ \;
+          cp artifacts/notes/notes.md notes.md
+          ls -l dist
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign every artifact (keyless, Sigstore)
+        run: |
+          cd dist
+          for f in *.tar.gz *.zip *.cdx.json; do
+            cosign sign-blob --yes --bundle "$f.sigstore.json" "$f"
+          done
+      - name: Provenance attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+      - name: Draft the GitHub release (a human publishes it)
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          body_path: notes.md
+          files: dist/*
+          fail_on_unmatched_files: true

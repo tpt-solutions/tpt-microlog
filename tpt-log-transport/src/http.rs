@@ -30,11 +30,14 @@ pub(crate) fn client_from_config(config: &Config) -> reqwest::blocking::Client {
                     builder = builder.add_root_certificate(cert);
                 }
                 Err(e) => {
-                    eprintln!("tpt-microlog: ignoring invalid CA cert {path}: {e}");
+                    tpt_log_core::diag::report(
+                        "config",
+                        &format!("ignoring invalid CA cert {path}: {e}"),
+                    );
                 }
             },
             Err(e) => {
-                eprintln!("tpt-microlog: cannot read ca_cert {path}: {e}");
+                tpt_log_core::diag::report("config", &format!("cannot read ca_cert {path}: {e}"));
             }
         }
     }
@@ -44,7 +47,10 @@ pub(crate) fn client_from_config(config: &Config) -> reqwest::blocking::Client {
                 builder = builder.proxy(proxy);
             }
             Err(e) => {
-                eprintln!("tpt-microlog: ignoring invalid proxy '{proxy_url}': {e}");
+                tpt_log_core::diag::report(
+                    "config",
+                    &format!("ignoring invalid proxy '{proxy_url}': {e}"),
+                );
             }
         }
     }

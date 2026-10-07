@@ -392,6 +392,27 @@ pub struct Config {
     pub redact_patterns: Vec<String>,
     /// Enable built-in detectors (email, card, SSN, JWT, bearer, AWS key).
     pub redact_builtin: bool,
+    /// Fold identical entries (same level + message) seen within this many
+    /// milliseconds into the first, adding `repeat_count`. 0 = off.
+    pub dedup_window_ms: u64,
+    /// Routine (below WARN) entries allowed per second. 0 = unlimited.
+    pub rate_limit_per_sec: u32,
+    /// Sample routine entries harder as the ingestion queue fills.
+    pub adaptive_sampling: bool,
+    /// Lowest sampling rate adaptive sampling falls to (0.0 - 1.0).
+    pub adaptive_sampling_floor: f64,
+    /// Keep this many recent low-severity entries and ship them only when an
+    /// ERROR/FATAL follows. 0 = off.
+    pub flight_recorder_size: usize,
+    /// Entries at or below this level go to the flight recorder.
+    pub flight_recorder_max_level: String,
+    /// Entries per UTC day; sampling tightens automatically to stay within
+    /// it. WARN and above are never limited. 0 = no budget.
+    pub daily_budget_entries: u64,
+    /// `host:port` for a plain-HTTP health endpoint (`/healthz`, `/stats`).
+    pub health_bind: Option<String>,
+    /// Emit the logger's own health as metrics every N ms. 0 = off.
+    pub self_metrics_interval_ms: u64,
 
     /// Whether newline-delimited base64 framing is used for the WAL.
     pub wal_frame_newline: bool,
@@ -459,6 +480,15 @@ impl Default for Config {
             redact_keys: Vec::new(),
             redact_patterns: Vec::new(),
             redact_builtin: false,
+            dedup_window_ms: 0,
+            rate_limit_per_sec: 0,
+            adaptive_sampling: false,
+            adaptive_sampling_floor: 0.1,
+            flight_recorder_size: 0,
+            flight_recorder_max_level: "DEBUG".to_string(),
+            daily_budget_entries: 0,
+            health_bind: None,
+            self_metrics_interval_ms: 0,
             wal_frame_newline: true,
         }
     }
@@ -546,6 +576,15 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "redact_keys",
     "redact_patterns",
     "redact_builtin",
+    "dedup_window_ms",
+    "rate_limit_per_sec",
+    "adaptive_sampling",
+    "adaptive_sampling_floor",
+    "flight_recorder_size",
+    "flight_recorder_max_level",
+    "daily_budget_entries",
+    "health_bind",
+    "self_metrics_interval_ms",
     "wal_frame_newline",
 ];
 
@@ -744,6 +783,25 @@ impl Config {
         }
         if let Some(v) = env("TPT_LOG_REDACT_KEYS") {
             self.redact_keys = split_comma_list(&v);
+        }
+        if let Some(v) = env("TPT_LOG_DEDUP_WINDOW_MS").and_then(|s| s.parse().ok()) {
+            self.dedup_window_ms = v;
+        }
+        if let Some(v) = env("TPT_LOG_RATE_LIMIT_PER_SEC").and_then(|s| s.parse().ok()) {
+            self.rate_limit_per_sec = v;
+        }
+        if let Some(v) = env("TPT_LOG_ADAPTIVE_SAMPLING") {
+            self.adaptive_sampling =
+                matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+        }
+        if let Some(v) = env("TPT_LOG_FLIGHT_RECORDER_SIZE").and_then(|s| s.parse().ok()) {
+            self.flight_recorder_size = v;
+        }
+        if let Some(v) = env("TPT_LOG_DAILY_BUDGET_ENTRIES").and_then(|s| s.parse().ok()) {
+            self.daily_budget_entries = v;
+        }
+        if let Some(v) = env("TPT_LOG_HEALTH_BIND") {
+            self.health_bind = Some(v);
         }
         if let Some(v) = env("TPT_LOG_REDACT_BUILTIN") {
             self.redact_builtin = matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
@@ -1012,6 +1070,10 @@ impl Config {
         }
         self.wal_dir = expand_tilde(&self.wal_dir);
         self.sample_rate = self.sample_rate.clamp(0.0, 1.0);
+        self.adaptive_sampling_floor = self.adaptive_sampling_floor.clamp(0.0, 1.0);
+        if self.flight_recorder_max_level.parse::<LogLevel>().is_err() {
+            self.flight_recorder_max_level = "DEBUG".to_string();
+        }
         self.sample_rate_by_level
             .retain(|k, _| k.parse::<LogLevel>().is_ok());
     }

@@ -5,6 +5,7 @@ members = [
     "tpt-log-transport",
     "tpt-log-ffi",
     "tpt-log-cli",
+    "tpt-log-agent",
     "tpt-log-py",
     "tpt-log-wasm",
 ]

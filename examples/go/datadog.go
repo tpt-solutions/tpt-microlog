@@ -10,7 +10,7 @@ import (
 	"log"
 	"os"
 
-	microlog "github.com/tpt-solutions/tpt-microlog-go"
+	microlog "github.com/tpt-solutions/tpt-microlog/tpt-log-go"
 )
 
 func main() {

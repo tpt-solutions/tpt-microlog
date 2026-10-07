@@ -50,6 +50,18 @@ export interface MicroLogOptions {
   onError?: (kind: string, message: string) => void;
 }
 
+/** Registry of typed events: augment it to type-check `log.event(...)`. */
+// eslint-disable-next-line @typescript-eslint/no-empty-interface
+export interface EventMap {}
+
+/** Options for {@link MicroLog.event}. */
+export interface EventOptions {
+  /** Severity (default `"INFO"`). */
+  level?: 'TRACE' | 'DEBUG' | 'INFO' | 'WARN' | 'ERROR' | 'FATAL';
+  /** Schema version recorded as `event_version` (default 1). */
+  version?: number;
+}
+
 /**
  * Ultra-lightweight browser telemetry & log router.
  *
@@ -85,6 +97,22 @@ export class MicroLog {
   warn(message: string, metadata?: Metadata): void;
   error(message: string, metadata?: Metadata): void;
   fatal(message: string, metadata?: Metadata): void;
+
+  /**
+   * Log a structured event. Augment {@link EventMap} to make event names and
+   * their fields type-checked:
+   *
+   * ```ts
+   * declare module 'tpt-microlog' {
+   *   interface EventMap {
+   *     order_placed: { orderId: number; totalCents: number };
+   *   }
+   * }
+   * log.event('order_placed', { orderId: 7, totalCents: 1999 });
+   * ```
+   */
+  event<K extends keyof EventMap>(name: K, fields: EventMap[K], options?: EventOptions): void;
+  event(name: string, fields?: Metadata, options?: EventOptions): void;
 
   /** Record a numeric metric with optional tags. */
   metric(name: string, value: number, tags?: Metadata): void;

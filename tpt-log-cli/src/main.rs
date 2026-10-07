@@ -8,6 +8,8 @@
 //! tpt-microlog send-test [MESSAGE] [--config PATH]
 //! ```
 
+mod inspect;
+
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
@@ -28,6 +30,10 @@ USAGE:
   tpt-microlog wal replay [--config PATH]       resend pending batches now
   tpt-microlog wal dead [--config PATH]         list dead-lettered batches
   tpt-microlog wal purge [--dead] [--config PATH]  delete pending (or dead) batches
+  tpt-microlog wal query [--dead] [--level L] [--grep S] [--limit N] [--json]
+                                                decode and search undelivered entries
+  tpt-microlog support-bundle [--out FILE|-] [--entries N]
+                                                masked diagnostics to attach to an issue
   tpt-microlog tail FILE [-f]                   pretty-print a file-backend JSONL log
   tpt-microlog send-test [MESSAGE] [--config PATH]  deliver one entry and report the result
 
@@ -41,6 +47,7 @@ fn main() -> ExitCode {
         Some("doctor") => doctor(&args[1..]),
         Some("wal") => wal_cmd(&args[1..]),
         Some("tail") => tail(&args[1..]),
+        Some("support-bundle") => support_bundle(&args[1..]),
         Some("send-test") => send_test(&args[1..]),
         Some("-h") | Some("--help") | Some("help") | None => {
             println!("{USAGE}");
@@ -218,7 +225,7 @@ fn wal_cmd(args: &[String]) -> Result<bool, String> {
     let sub = args
         .first()
         .map(String::as_str)
-        .ok_or("wal needs a subcommand: ls|replay|dead|purge")?;
+        .ok_or("wal needs a subcommand: ls|query|replay|dead|purge")?;
     let rest = &args[1..];
     let cfg = load_config(rest);
     let dir = wal_dir_for(&cfg);
@@ -239,6 +246,7 @@ fn wal_cmd(args: &[String]) -> Result<bool, String> {
                 );
             }
         }
+        "query" => return inspect::wal_query(&wal, rest),
         "dead" => {
             let dead = wal.dead_dir();
             let names = list_files(&dead);
@@ -292,6 +300,20 @@ fn wal_cmd(args: &[String]) -> Result<bool, String> {
         other => return Err(format!("unknown wal subcommand '{other}'")),
     }
     Ok(true)
+}
+
+fn support_bundle(args: &[String]) -> Result<bool, String> {
+    let cfg = load_config(args);
+    let dir = wal_dir_for(&cfg);
+    // A missing/locked WAL must not stop the bundle: that is often the bug.
+    let wal = Wal::open(&dir, cfg.wal_max_size_bytes).ok();
+    if wal.is_none() {
+        eprintln!(
+            "note: could not open the WAL at {} (locked by a running logger?)",
+            dir.display()
+        );
+    }
+    inspect::support_bundle(&cfg, wal.as_ref(), args)
 }
 
 fn list_paths(dir: &std::path::Path) -> Vec<PathBuf> {

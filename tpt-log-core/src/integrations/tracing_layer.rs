@@ -162,6 +162,15 @@ where
         if let Some(l) = meta.line() {
             md.insert("line".into(), l.into());
         }
+        // Correlate with the innermost span: W3C-sized trace id (the root
+        // span) and the span's own id, matching the span entries below.
+        if let Some(span) = ctx.event_span(event) {
+            let root = span.scope().last().map_or_else(|| span.id(), |r| r.id());
+            md.entry("trace_id")
+                .or_insert_with(|| format!("{:032x}", root.into_u64()).into());
+            md.entry("span_id")
+                .or_insert_with(|| format!("{:016x}", span.id().into_u64()).into());
+        }
         if let Some(scope) = ctx.event_scope(event) {
             let spans: Vec<Value> = scope
                 .from_root()
@@ -209,7 +218,7 @@ where
         let parent = span.parent().map(|p| format!("{:016x}", p.id().into_u64()));
         self.log.span(
             span.name(),
-            format!("{trace_id:016x}"),
+            format!("{trace_id:032x}"),
             format!("{:016x}", id.into_u64()),
             parent,
             duration_us,
@@ -280,6 +289,11 @@ mod tests {
             .expect("closed span recorded");
         let s = &db_span.metadata["span"];
         assert!(s["parent_span_id"].is_string());
-        assert_eq!(s["trace_id"].as_str().unwrap().len(), 16);
+        assert_eq!(s["trace_id"].as_str().unwrap().len(), 32);
+        assert_eq!(
+            slow.metadata["trace_id"], s["trace_id"],
+            "event shares the span's trace"
+        );
+        assert_eq!(slow.metadata["span_id"].as_str().unwrap().len(), 16);
     }
 }

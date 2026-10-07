@@ -1,3 +1,8 @@
+use std::sync::Arc;
+
+use crate::governor::{
+    adaptive_rate, DailyBudget, Decision, Dedup, DedupOutcome, FlightRecorder, RateLimiter,
+};
 use crate::{LogEntry, LogLevel, LogType};
 
 /// Pre-send transforms applied to every entry before batching.
@@ -20,6 +25,16 @@ pub struct EntryProcessor {
     pub enrichment: Option<EnrichmentContext>,
     /// PII/secret redaction, applied last so dropped entries cost nothing.
     pub redactor: crate::redact::Redactor,
+    /// Fold bursts of identical entries (`dedup_window_ms`).
+    pub dedup: Option<Arc<Dedup>>,
+    /// Cap routine entries per second (`rate_limit_per_sec`).
+    pub rate_limiter: Option<Arc<RateLimiter>>,
+    /// Sample routine entries harder as the queue fills (floor = lowest rate).
+    pub adaptive_floor: Option<f64>,
+    /// Daily volume budget that tightens sampling automatically.
+    pub budget: Option<Arc<DailyBudget>>,
+    /// Error-triggered flight recorder for low-severity context.
+    pub recorder: Option<Arc<FlightRecorder>>,
 }
 
 impl std::fmt::Debug for EntryProcessor {
@@ -31,6 +46,11 @@ impl std::fmt::Debug for EntryProcessor {
             .field("sample_rate", &self.sample_rate)
             .field("sample_rate_by_level", &self.sample_rate_by_level)
             .field("enrichment", &self.enrichment)
+            .field("dedup", &self.dedup.is_some())
+            .field("rate_limiter", &self.rate_limiter.is_some())
+            .field("adaptive_floor", &self.adaptive_floor)
+            .field("budget", &self.budget.is_some())
+            .field("recorder", &self.recorder.is_some())
             .finish()
     }
 }
@@ -45,6 +65,11 @@ impl Default for EntryProcessor {
             sample_rate_by_level: Vec::new(),
             enrichment: None,
             redactor: crate::redact::Redactor::default(),
+            dedup: None,
+            rate_limiter: None,
+            adaptive_floor: None,
+            budget: None,
+            recorder: None,
         }
     }
 }
@@ -70,6 +95,11 @@ impl EntryProcessor {
             || self.drop_regex.is_some()
             || !self.drop_tags.is_empty()
             || self.redactor.is_enabled()
+            || self.dedup.is_some()
+            || self.rate_limiter.is_some()
+            || self.adaptive_floor.is_some()
+            || self.budget.is_some()
+            || self.recorder.is_some()
     }
 
     /// Effective sampling rate for `entry`: WARN and above are never sampled,
@@ -94,12 +124,24 @@ impl EntryProcessor {
 
     /// Filter/enrich `entry` in place. Returns `false` when the entry should
     /// be dropped. In-place mutation avoids a copy of every entry on the hot
-    /// path.
+    /// path. See [`EntryProcessor::process_with`] for the reason it was dropped.
     pub fn process(&self, entry: &mut LogEntry) -> bool {
+        self.process_with(entry, 0.0) == Decision::Keep
+    }
+
+    /// Like [`process`](Self::process), but aware of queue `pressure`
+    /// (0.0 empty .. 1.0 full) for adaptive sampling, and reporting *why* an
+    /// entry was dropped.
+    ///
+    /// Order: drop filters, flight recorder, `min_level`, sampling (static x
+    /// adaptive x daily budget), rate limit, de-duplication, then enrichment
+    /// and redaction. WARN and above (and metrics/spans) skip sampling and
+    /// rate limiting.
+    pub fn process_with(&self, entry: &mut LogEntry, pressure: f64) -> Decision {
         // Drop filters apply to everything, including metrics.
         if let Some(re) = &self.drop_regex {
             if re.is_match(&entry.message) {
-                return false;
+                return Decision::Filtered;
             }
         }
         if !self.drop_tags.is_empty() {
@@ -108,28 +150,75 @@ impl EntryProcessor {
                 .iter()
                 .any(|(key, value)| entry.metadata.get(key).is_some_and(|v| v == value));
             if matches_tag {
-                return false;
+                return Decision::Filtered;
+            }
+        }
+        // Low-severity entries wait in the flight recorder for an error. They
+        // are redacted before being stored, never shipped on their own.
+        if let Some(recorder) = &self.recorder {
+            if recorder.captures(entry) {
+                let mut held = entry.clone();
+                self.finalize(&mut held);
+                recorder.record(held);
+                return Decision::Recorded;
             }
         }
         // Level filtering and sampling never apply to metrics or spans.
         if entry.log_type == LogType::Log {
             if let Some(min) = self.min_level {
                 if entry.level < min {
-                    return false;
+                    return Decision::Filtered;
                 }
             }
         }
-        if let Some(rate) = self.sample_rate_for(entry) {
-            if rate < 1.0 {
-                let roll = {
-                    use rand::Rng;
-                    rand::thread_rng().gen::<f64>()
-                };
-                if roll > rate {
-                    return false;
+        let routine = entry.log_type == LogType::Log && entry.level < LogLevel::Warn;
+        let mut rate = self.sample_rate_for(entry).unwrap_or(1.0);
+        if routine {
+            if let Some(floor) = self.adaptive_floor {
+                rate *= adaptive_rate(pressure, floor);
+            }
+            if let Some(budget) = &self.budget {
+                rate *= budget.offer(entry.timestamp);
+            }
+        }
+        if rate < 1.0 {
+            let roll = {
+                use rand::Rng;
+                rand::thread_rng().gen::<f64>()
+            };
+            if roll > rate {
+                return Decision::Sampled;
+            }
+        }
+        if routine {
+            if let Some(limiter) = &self.rate_limiter {
+                if !limiter.allow(entry.timestamp) {
+                    return Decision::RateLimited;
                 }
             }
         }
+        if entry.log_type == LogType::Log {
+            if let Some(dedup) = &self.dedup {
+                match dedup.check(entry) {
+                    DedupOutcome::Suppress => return Decision::Deduplicated,
+                    DedupOutcome::Pass {
+                        repeat_count: Some(n),
+                    } => {
+                        entry.metadata.insert("repeat_count".into(), n.into());
+                    }
+                    DedupOutcome::Pass { repeat_count: None } => {}
+                }
+            }
+        }
+        if let Some(budget) = &self.budget {
+            budget.spend(entry.timestamp);
+        }
+        self.finalize(entry);
+        Decision::Keep
+    }
+
+    /// Enrichment and redaction: the last step for every delivered entry.
+    pub fn finalize(&self, entry: &mut LogEntry) {
         if let Some(enc) = &self.enrichment {
             entry
                 .metadata
@@ -152,7 +241,30 @@ impl EntryProcessor {
             }
         }
         self.redactor.apply(entry);
-        true
+    }
+
+    /// Context to ship ahead of `entry` when it is an ERROR/FATAL: everything
+    /// the flight recorder holds (oldest first). Empty otherwise.
+    pub fn take_flight_context(&self, entry: &LogEntry) -> Vec<LogEntry> {
+        match &self.recorder {
+            Some(recorder) if entry.log_type == LogType::Log && entry.level >= LogLevel::Error => {
+                recorder.take()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// `repeat_count` summaries for de-duplication windows that closed (or,
+    /// with `force`, every open one: flush and shutdown).
+    pub fn drain_summaries(&self, now_ms: u64, force: bool) -> Vec<LogEntry> {
+        let Some(dedup) = &self.dedup else {
+            return Vec::new();
+        };
+        let mut out = dedup.drain_summaries(now_ms, force);
+        for entry in &mut out {
+            self.finalize(entry);
+        }
+        out
     }
 }
 
@@ -315,5 +427,39 @@ mod tests {
         assert!(!p.process(&mut noisy));
         assert!(p.process(&mut tagged));
         assert!(p.process(&mut clean));
+    }
+
+    #[test]
+    fn adaptive_sampling_only_engages_under_pressure_and_spares_warnings() {
+        let p = EntryProcessor {
+            adaptive_floor: Some(0.0),
+            ..Default::default()
+        };
+        let keep = |level, pressure| {
+            (0..200)
+                .filter(|_| {
+                    let mut e = LogEntry::new(level, "x");
+                    p.process_with(&mut e, pressure) == Decision::Keep
+                })
+                .count()
+        };
+        assert_eq!(
+            keep(LogLevel::Info, 0.2),
+            200,
+            "idle queue: nothing sampled"
+        );
+        assert_eq!(
+            keep(LogLevel::Info, 1.0),
+            0,
+            "full queue with floor 0: routine dropped"
+        );
+        assert_eq!(keep(LogLevel::Error, 1.0), 200, "errors always pass");
+        let half = keep(LogLevel::Debug, 0.75);
+        assert!(
+            (60..=140).contains(&half),
+            "~50% at 75% pressure, got {half}"
+        );
+        let mut dropped = LogEntry::new(LogLevel::Info, "x");
+        assert_eq!(p.process_with(&mut dropped, 1.0), Decision::Sampled);
     }
 }

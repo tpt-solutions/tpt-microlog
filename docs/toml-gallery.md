@@ -224,6 +224,71 @@ DEBUG = 0.05
 INFO = 0.5
 ```
 
+## Collapse noisy repeats
+
+Identical entries (same level and message) within the window are folded into
+the first one, which then carries a `repeat_count`. Windows that end with
+suppressed repeats emit a summary entry (`repeat_summary = true`).
+
+```toml
+backend = "http"
+endpoint = "https://logs.example.com/v1"
+dedup_window_ms = 5000
+```
+
+## Ship DEBUG context only when something fails
+
+The last 200 DEBUG/TRACE entries are held in memory (redacted) and shipped,
+oldest first, right before the next ERROR or FATAL. Until then DEBUG costs no
+network or storage.
+
+```toml
+backend = "http"
+endpoint = "https://logs.example.com/v1"
+min_level = "INFO"
+flight_recorder_size = 200
+flight_recorder_max_level = "DEBUG"
+```
+
+## Stay inside a daily volume budget
+
+Sampling tightens automatically so the projected daily total lands on the
+budget. WARN and above are never limited.
+
+```toml
+backend = "datadog"
+api_key = "<your-datadog-api-key>"
+daily_budget_entries = 5000000
+```
+
+## Shed load before the queue fills
+
+Routine entries are sampled harder as the ingestion queue fills (from half
+full down to the floor); errors always pass. A per-second cap adds a hard
+ceiling on routine volume.
+
+```toml
+backend = "http"
+endpoint = "https://logs.example.com/v1"
+queue_capacity = 20000
+adaptive_sampling = true
+adaptive_sampling_floor = 0.05
+rate_limit_per_sec = 2000
+```
+
+## Health endpoint and self-telemetry
+
+`GET /healthz` returns 200 (`ok` or `degraded`) or 503 (`down`/`stopped`) with
+a JSON body; `GET /stats` adds the counters. The same numbers are also emitted
+as `microlog.*` metrics every 30 seconds.
+
+```toml
+backend = "datadog"
+api_key = "<your-datadog-api-key>"
+health_bind = "127.0.0.1:9477"
+self_metrics_interval_ms = 30000
+```
+
 ## Bounded memory under backpressure
 
 Drop the oldest buffered entries instead of blocking the application.

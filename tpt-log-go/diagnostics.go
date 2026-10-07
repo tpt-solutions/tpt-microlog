@@ -1,7 +1,6 @@
 package microlog
 
 /*
-#cgo LDFLAGS: -ltpt_log_ffi
 #include <stdlib.h>
 #include "tpt_microlog.h"
 

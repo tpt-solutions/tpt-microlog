@@ -164,3 +164,33 @@ func TestNewFromTOMLAndErrorHandler(t *testing.T) {
 		t.Fatal("expected an error for empty config")
 	}
 }
+
+func TestHealthAndGovernorStats(t *testing.T) {
+	log, err := NewFromTOML("backend = \"none\"\nwal_enabled = false\nbatch_size = 1\ndedup_window_ms = 60000\n")
+	if err != nil {
+		t.Fatalf("NewFromTOML: %v", err)
+	}
+	defer log.Close()
+	for i := 0; i < 4; i++ {
+		if err := log.Warn("same message", nil); err != nil {
+			t.Fatalf("Warn: %v", err)
+		}
+	}
+	if err := log.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	st, err := log.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if st.DeduplicatedEntries != 3 {
+		t.Fatalf("DeduplicatedEntries = %d, want 3", st.DeduplicatedEntries)
+	}
+	h, err := log.Health()
+	if err != nil {
+		t.Fatalf("Health: %v", err)
+	}
+	if h.Status != "ok" || h.QueueCapacity == 0 {
+		t.Fatalf("unexpected health: %+v", h)
+	}
+}

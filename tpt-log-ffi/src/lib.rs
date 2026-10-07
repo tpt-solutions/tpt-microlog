@@ -515,36 +515,20 @@ pub unsafe extern "C" fn tpt_log_stats_json(
         if buf.is_null() {
             return codes::NULL_ARGUMENT;
         }
-        let relaxed = std::sync::atomic::Ordering::Relaxed;
-        let (stats, queued, inflight) = if handle.is_null() {
-            (None, 0, 0)
+        let (counters, queued, inflight) = if handle.is_null() {
+            (tpt_log_core::microlog::Stats::default().counters(), 0, 0)
         } else {
             // SAFETY: caller contract (live handle or NULL).
             let inner = unsafe { &(*handle).inner };
-            (
-                Some(inner.stats() as &tpt_log_core::microlog::Stats),
-                inner.queued(),
-                inner.inflight(),
-            )
+            (inner.stats().counters(), inner.queued(), inner.inflight())
         };
-        macro_rules! field {
-            ($c:ident) => {
-                stats.map(|s| s.$c.load(relaxed)).unwrap_or(0)
-            };
+        let mut obj = serde_json::Map::new();
+        for (name, value) in counters {
+            obj.insert(name.into(), value.into());
         }
-        let json = format!(
-            "{{\"delivered_batches\":{},\"delivered_entries\":{},\"wal_writes\":{},\
-             \"retried_entries\":{},\"dropped_batches\":{},\"dropped_entries\":{},\
-             \"queued\":{},\"inflight\":{}}}",
-            field!(delivered_batches),
-            field!(delivered_entries),
-            field!(wal_writes),
-            field!(retried_entries),
-            field!(dropped_batches),
-            field!(dropped_entries),
-            queued,
-            inflight,
-        );
+        obj.insert("queued".into(), queued.into());
+        obj.insert("inflight".into(), inflight.into());
+        let json = Value::Object(obj).to_string();
         let needed = json.len() + 1;
         if cap < needed {
             return codes::STATS_TOO_SMALL;
@@ -631,6 +615,42 @@ pub unsafe extern "C" fn tpt_log_create_from_toml(toml: *const c_char) -> *mut M
                 ptr::null_mut()
             }
         }
+    })
+}
+
+/// Logger health (status, queue depth, WAL backlog, delivery latency) as a
+/// JSON object written into `buf`; same contract as `tpt_log_stats_json`.
+/// A NULL handle reports `{"status":"stopped"}`.
+///
+/// # Safety
+/// `handle` must be a live handle or NULL; `buf` must be writable for `cap`
+/// bytes.
+#[no_mangle]
+pub unsafe extern "C" fn tpt_log_health_json(
+    handle: *mut MicroLogHandle,
+    buf: *mut c_char,
+    cap: usize,
+) -> i32 {
+    guarded(|| {
+        if buf.is_null() {
+            return codes::NULL_ARGUMENT;
+        }
+        let json = if handle.is_null() {
+            "{\"status\":\"stopped\"}".to_string()
+        } else {
+            // SAFETY: caller contract (live handle or NULL).
+            unsafe { &(*handle).inner }.health().to_json().to_string()
+        };
+        let needed = json.len() + 1;
+        if cap < needed {
+            return codes::STATS_TOO_SMALL;
+        }
+        let Ok(bytes) = std::ffi::CString::new(json) else {
+            return codes::PANIC;
+        };
+        // SAFETY: caller guarantees `cap >= needed` writable bytes at `buf`.
+        ptr::copy_nonoverlapping(bytes.as_ptr(), buf.cast(), needed);
+        needed as i32
     })
 }
 
