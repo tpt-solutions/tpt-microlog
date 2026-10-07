@@ -34,7 +34,7 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: All versions agree, and the tag matches them
         id: v
         run: |
@@ -65,7 +65,7 @@ jobs:
           - { os: macos-latest, target: aarch64-apple-darwin, name: darwin_arm64 }
           - { os: windows-latest, target: x86_64-pc-windows-msvc, name: windows_amd64 }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -119,7 +119,7 @@ jobs:
           # cgo on Windows uses the MinGW toolchain, so the library is built for -gnu.
           - { os: ubuntu-latest, target: x86_64-pc-windows-gnu, name: windows_amd64, cross: mingw }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -158,7 +158,7 @@ jobs:
     needs: verify
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@v2
         with:
