@@ -208,7 +208,7 @@ jobs:
       - uses: jetli/wasm-bindgen-action@v0.2.0
         with:
           version: ${{ steps.wb.outputs.version }}
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
       - name: Generate the Node glue and run the smoke test

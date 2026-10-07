@@ -55,7 +55,7 @@ jobs:
           after=$(stat -c %s tpt-log-wasm/dist/tpt_log_wasm_bg.wasm)
           echo "wasm-opt: $before -> $after bytes"
           [ "$after" -le "$before" ] || { echo "wasm-opt grew the binary"; exit 1; }
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
       - name: Node smoke test (same wasm-opt pass applied to the Node build)
@@ -86,7 +86,7 @@ jobs:
         with:
           name: npm-package
           path: pkg
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
