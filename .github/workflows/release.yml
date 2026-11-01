@@ -202,7 +202,7 @@ jobs:
             cosign sign-blob --yes --bundle "$f.sigstore.json" "$f"
           done
       - name: Provenance attestation
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
             dist/*.tar.gz
