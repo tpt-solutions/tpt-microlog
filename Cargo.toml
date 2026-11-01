@@ -25,7 +25,7 @@ zstd = "0.13"
 crossbeam-channel = "0.5"
 parking_lot = "0.12"
 thiserror = "2"
-toml = "0.8"
+toml = "1.1"
 base64 = "0.22"
 rand = { version = "0.8", features = ["small_rng"] }
 hostname = "0.4"
