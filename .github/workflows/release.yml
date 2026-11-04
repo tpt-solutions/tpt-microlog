@@ -208,7 +208,7 @@ jobs:
             dist/*.tar.gz
             dist/*.zip
       - name: Draft the GitHub release (a human publishes it)
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           draft: true
           body_path: notes.md
