@@ -46,7 +46,7 @@ jobs:
           fi
       - name: Release notes come from the changelog
         run: python3 scripts/release.py --notes "${{ steps.v.outputs.version }}" > notes.md
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: notes
           path: notes.md
@@ -99,7 +99,7 @@ jobs:
             asset="$stem.tar.gz"
           fi
           (cd dist && sha256sum "$asset" > "$asset.sha256")
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: binaries-${{ matrix.name }}
           path: dist/*
@@ -148,7 +148,7 @@ jobs:
           mkdir -p dist
           tar czf "dist/$stem.tar.gz" "$stem"
           (cd dist && sha256sum "$stem.tar.gz" > "$stem.tar.gz.sha256")
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ffi-${{ matrix.name }}
           path: dist/*
@@ -170,7 +170,7 @@ jobs:
           for crate in tpt-log-core tpt-log-transport tpt-log-ffi tpt-log-cli tpt-log-agent; do
             cp "$crate/$crate.cdx.json" "dist/${crate}-${{ needs.verify.outputs.version }}.cdx.json"
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sbom
           path: dist/*
