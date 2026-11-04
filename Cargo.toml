@@ -34,7 +34,7 @@ regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "json"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "net", "sync", "io-util"] }
 tonic = { version = "0.12", default-features = false, features = ["transport", "codegen", "prost"] }
-prost = "0.13"
+prost = "0.14"
 hmac = "0.12"
 sha2 = "0.11"
 
